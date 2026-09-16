@@ -40,6 +40,7 @@ venv/
 *.orig
 *.rej
 *~
+*.tmp
 *.7z
 *.zip
 *.tar.gz
