@@ -84,6 +84,12 @@ astock-screen/_step*.log
 astock-screen/_today_diag.txt
 astock-screen/_tom.txt
 
+# ---------- 一次性诊断脚本与输出（本地排查用）----------
+#   约定：临时排查产物一律以 `_` 开头，不会被入库。
+#   两个运行目录内不存在任何以 `_` 开头的「正式」文件，故可整类忽略。
+astock-screen/_*
+astock-realtime/_*
+
 # ---------- 归档目录：保留在本地供追溯，不入库 ----------
 archive/
 
