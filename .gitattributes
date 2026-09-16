@@ -1,0 +1,43 @@
+# ============================================================
+#  行尾与二进制处理
+#
+#  为什么需要：本项目在 Windows 上开发、部署到 Linux。
+#  若 shell 脚本被转成 CRLF，Linux 报错形如
+#      bash: ./install.sh: /bin/bash^M: bad interpreter: No such file or directory
+#      ./scripts/ctl-check.sh: line 12: $'\r': command not found
+#  这类问题只在部署时才暴露，排查成本高。在版本库层面锁定行尾可根除。
+# ============================================================
+
+# 默认：自动识别文本，统一以 LF 存入库
+* text=auto eol=lf
+
+# ---------- Linux 侧执行：必须 LF ----------
+*.sh                text eol=lf
+*.service.template  text eol=lf
+*.timer.template    text eol=lf
+*.conf              text eol=lf
+
+# ---------- 源码与文档：LF ----------
+*.py    text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.html  text eol=lf
+*.csv   text eol=lf
+
+# ---------- Windows 侧执行：CRLF（LF 会让 cmd 解析异常）----------
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# ---------- 二进制：不做任何转换 ----------
+*.7z      binary
+*.zip     binary
+*.tar.gz  binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.ico     binary
+*.xlsx    binary

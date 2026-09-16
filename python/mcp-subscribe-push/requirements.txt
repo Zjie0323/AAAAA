@@ -1,0 +1,5 @@
+# main.py 使用 mcp 1.x 的 Server.list_tools()/call_tool() 装饰器 API，
+# mcp 2.x 已移除该 API（报 AttributeError），必须锁 <2.0.0。
+mcp>=1.0.0,<2.0.0
+httpx>=0.27.0
+python-dotenv>=1.0.0

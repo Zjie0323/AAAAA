@@ -1,0 +1,18 @@
+[Unit]
+Description=A-stock Realtime Refresh Timer (盘后自动生成次日竞价名单)
+Documentation=file:///INSTALL_DIR_PLACEHOLDER/README.md
+
+[Timer]
+# 每交易日收盘后 15:10 触发（此时涨停池与封单数据已定盘）。
+#   周末：由 Mon..Fri 排除。
+#   法定节假日：由 refresh_watch.py 内部的开市判定排除，会打印
+#   「今日休市，跳过刷新」并以退出码 0 结束 —— 属正常，不是故障。
+OnCalendar=Mon..Fri 15:10
+# 打散整点负载（最多延迟 2 分钟）
+RandomizedDelaySec=120
+# 机器关机/服务停机而错过的任务，开机后补跑一次
+Persistent=true
+Unit=APP_NAME_PLACEHOLDER-refresh.service
+
+[Install]
+WantedBy=timers.target

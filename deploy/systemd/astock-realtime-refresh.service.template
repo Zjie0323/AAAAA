@@ -1,0 +1,37 @@
+[Unit]
+Description=A-stock Realtime Refresh (A股看板 · 竞价观察名单刷新)
+Documentation=file:///INSTALL_DIR_PLACEHOLDER/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=RUN_USER_PLACEHOLDER
+Group=RUN_GROUP_PLACEHOLDER
+WorkingDirectory=SCREEN_DIR_PLACEHOLDER
+
+# 环境变量：确保中文/UTF-8 输出不乱码，Python 不缓冲日志
+Environment=LANG=en_US.UTF-8
+Environment=LC_ALL=en_US.UTF-8
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+
+# 生成次日竞价观察名单：抓今日收盘涨停池 -> 算基因池(缺则补) -> 写 tomorrow_watch.json
+ExecStart=PYTHON_BIN_PLACEHOLDER SCREEN_DIR_PLACEHOLDER/refresh_watch.py
+
+# 含多次上游请求，给足 15 分钟；休市日会立即以退出码 0 结束
+TimeoutStartSec=900
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=APP_NAME_PLACEHOLDER-refresh
+
+# ---- 安全加固（与主服务同档）----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

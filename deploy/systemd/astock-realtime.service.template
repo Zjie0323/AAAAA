@@ -1,0 +1,53 @@
+[Unit]
+Description=A-stock Realtime Board (A股实时看板后端服务)
+Documentation=file:///INSTALL_DIR_PLACEHOLDER/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=RUN_USER_PLACEHOLDER
+Group=RUN_GROUP_PLACEHOLDER
+WorkingDirectory=INSTALL_DIR_PLACEHOLDER
+
+# 环境变量：确保中文/UTF-8 输出不乱码，Python 不缓冲日志
+Environment=LANG=en_US.UTF-8
+Environment=LC_ALL=en_US.UTF-8
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+
+# 启动命令：在工作目录下运行 server.py，监听端口由 server.py argv 传入
+ExecStart=PYTHON_BIN_PLACEHOLDER INSTALL_DIR_PLACEHOLDER/server.py SERVE_PORT_PLACEHOLDER
+
+# 崩溃自动重启：5秒后重启，max 10次/100秒（防启动风暴）
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=100
+StartLimitBurst=10
+
+# 停止方式：SIGINT 让 server.py 走 KeyboardInterrupt 优雅分支，10秒后强杀
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=STOP_TIMEOUT_PLACEHOLDER
+
+# 日志：标准输出/错误交由 journald 收集
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=astock-realtime
+
+# ---- 安全加固（纵深防御）----
+# 只允许写入日志目录与其他少量必要路径
+ReadWritePaths=LOG_DIR_PLACEHOLDER
+# 最小权限：禁止提权、保护系统目录、隐藏 /home
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# 该服务仅需网络出站（访问东方财富接口）与本地监听
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

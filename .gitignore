@@ -1,0 +1,97 @@
+# ============================================================
+#  A股量化工具集 · Git 忽略规则
+#
+#  原则：源码与部署物料进版本库；数据、产物、日志、凭据一律排除。
+#  判断标准 —— 该文件是否「每次运行都会变化」？
+#    会变化 → 忽略（由服务器/本地生成，入库只会污染 diff 且迅速过期）
+#    不变化 → 入库（源码、部署物料、慢变数据）
+# ============================================================
+
+# ---------- 凭据：绝不入库 ----------
+.env
+*.env
+!.env.example
+*.pem
+*.key
+*_secret.*
+mcp.json
+
+# 本仓库专用的 GitHub SSH 私钥（部署密钥，仅本机持有）
+#   公钥 id_ed25519_github.pub 可入库用于追溯；私钥绝不入库
+.gitkeys/
+id_ed25519*
+!id_ed25519*.pub
+
+# ---------- 构建产物（可由 tools/ 脚本重新生成）----------
+deploy/app/
+dist/
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---------- 备份 / 临时 / 压缩包 ----------
+*.bak
+*.bak-*
+*.bak.*
+*.orig
+*.rej
+*~
+*.7z
+*.zip
+*.tar.gz
+
+# ---------- 日志 ----------
+*.log
+*.err
+logs/
+
+# ---------- 运行时数据：astock-realtime ----------
+#   _changes_buffer.json 由服务进程持续改写；其余为定盘/推送状态
+astock-realtime/_changes_buffer.json
+astock-realtime/_ui_fixture.json
+astock-realtime/_bid_picks_*.json
+astock-realtime/_auto_push_state_*.json
+
+# ---------- 日K缓存：22 MB / 1194 文件，不入库 ----------
+#   服务器侧自行维护；如需在全新环境重建基因池，从旧环境拷贝
+#   astock-screen/kdata/，或直接跑 limit_up.py 重新抓取（较慢）
+astock-screen/kdata/
+
+# ---------- 每日行情产物：由服务器本地盘后生成 ----------
+#   固定打包/入库会过期误导 —— 基准日错位会让次日复盘退化成
+#   「自我对照」（晋级率/红盘率双双 100%），结论完全失真
+astock-screen/tomorrow_watch.json
+astock-screen/tomorrow_watch.txt
+astock-screen/tomorrow_watch.html
+astock-screen/tomorrow_watch_*.json
+astock-screen/live_raw.json
+astock-screen/live_raw_*.json
+astock-screen/limit_live.html
+
+# ---------- 复盘中间件与报告 ----------
+#   _review_*.json 是复盘数据，review_*.html 是由它渲染的报告；
+#   两者都可由 gen_review.py 在服务器上重新生成
+astock-screen/_review.json
+astock-screen/_review_*.json
+astock-screen/review_*.html
+astock-screen/_win_verify.txt
+astock-screen/_step*.log
+astock-screen/_today_diag.txt
+astock-screen/_tom.txt
+
+# ---------- 归档目录：保留在本地供追溯，不入库 ----------
+archive/
+
+# ---------- 工作区记忆（可能含内网地址与凭据）----------
+.workbuddy/
+
+# ---------- 编辑器 / 操作系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
