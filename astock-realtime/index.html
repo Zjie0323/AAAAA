@@ -392,7 +392,7 @@
     <canvas id="trendCanvas" width="760" height="440" style="display:none"></canvas>
     <div id="trendReadout"></div>
     <div id="trendErr" class="err" style="display:none"></div>
-    <div class="note" id="trendNote">数据源：分时=东方财富 push2his，日K=腾讯（不复权，末根为当日盘中实时）。红涨绿跌。下方为<b>成交量柱</b>；日K视图含 <b>MA5 / MA10 / MA20</b>。<b>点击图中任意位置</b>查看该点读数（再点同一点取消）。</div>
+    <div class="note" id="trendNote">数据源：分时=东方财富 push2his，日K=腾讯（不复权，末根为当日盘中实时）。红涨绿跌。下方为<b>成交量柱</b>；<b>分时右轴</b>同时标注价格与涨跌幅（上行价格 / 下行涨跌幅，相对昨收着色）；日K视图含 <b>MA5 / MA10 / MA20</b>。<b>点击图中任意位置</b>查看该点读数（再点同一点取消）。</div>
   </div>
 </div>
 
@@ -1546,15 +1546,31 @@ function drawTrends(d, name){
   paintTrends();
 }
 // 价格网格 + 右侧刻度(分时/日K共用)
-function drawGrid(ctx,G,W,lo,hi,Y){
+//   opt.pre 传入昨收时, 右轴改为「价格 + 涨跌幅%」双行标注(仅分时视图使用);
+//   不传则维持单行价格(日K视图, 其涨跌幅语义不同, 不在此标注)
+function drawGrid(ctx,G,W,lo,hi,Y,opt){
+  const pre=(opt && opt.pre!=null && Number(opt.pre)>0)? Number(opt.pre) : null;
   ctx.strokeStyle='#232c42'; ctx.lineWidth=1;
   ctx.font='10px ui-monospace,Menlo,Consolas,monospace';
-  ctx.textAlign='left'; ctx.textBaseline='middle';
+  ctx.textAlign='left';
+  const tx=W-G.padR+5;
   for(let k=0;k<=3;k++){
     const v=lo+(hi-lo)*k/3, y=Y(v);
     ctx.beginPath(); ctx.moveTo(G.padL,y); ctx.lineTo(W-G.padR,y); ctx.stroke();
-    ctx.fillStyle='#6f7d97';
-    ctx.fillText(v.toFixed(2), W-G.padR+5, y);
+    if(pre==null){
+      ctx.textBaseline='middle'; ctx.fillStyle='#6f7d97';
+      ctx.fillText(v.toFixed(2), tx, y);
+    }else{
+      // 上行价格 / 下行涨跌幅; 涨跌幅按相对昨收着色(红涨绿跌, 持平走灰)
+      let pct=(v/pre-1)*100, col='#6f7d97';
+      if(pct>0.005) col='#f23645';
+      else if(pct<-0.005) col='#2bbf6a';
+      else pct=0;                      // 避免出现 "-0.00%"
+      ctx.textBaseline='bottom'; ctx.fillStyle='#6f7d97';
+      ctx.fillText(v.toFixed(2), tx, y-1);
+      ctx.textBaseline='top'; ctx.fillStyle=col;
+      ctx.fillText((pct>0?'+':'')+pct.toFixed(2)+'%', tx, y+2);
+    }
   }
   ctx.textAlign='start'; ctx.textBaseline='alphabetic';
 }
@@ -1584,7 +1600,7 @@ function paintTrends(){
   const VY=v=> G.volBot - (G.volBot-G.volTop)*(v/maxV);
   ctx.clearRect(0,0,W,H);
   ctx.fillStyle='#161d2e'; ctx.fillRect(0,0,W,H);
-  drawGrid(ctx,G,W,min,max,Y);
+  drawGrid(ctx,G,W,min,max,Y,{pre:pre});
   // ▲ 成交量柱(分钟级): 红绿按「该分钟收盘 vs 开盘」判定, 与分钟K一致
   const bw=Math.max(1,(W-G.padL-G.padR)/Math.max(n,1)*0.8);
   pts.forEach((p,i)=>{

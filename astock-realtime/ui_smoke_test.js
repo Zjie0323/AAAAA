@@ -2,6 +2,8 @@
 // 用法: node ui_smoke_test.js
 //   - 脚本自 index.html 提取, 响应数据取自运行中的服务(8000); 服务未运行时回退 _ui_fixture.json
 // 覆盖: ①定盘卡片 ②实时卡片 ③无定盘兼容 ④分时点击读数(涨幅%) ⑤9:25-9:30窗口 ⑥开盘后双区
+//       ⑦分时量柱 ⑧日K(蜡烛+均线+量柱) ⑨日K点击命中 ⑩视图切换命中口径 ⑪分时右轴涨跌幅标注
+//       ⑫右轴标注像素级几何校验(不越界/不压量区)
 const fs = require('fs');
 const path = require('path');
 const DIR = __dirname;
@@ -27,13 +29,16 @@ async function loadFixture(){
 }
 
 // 绘制调用计数: 用于断言「量柱/蜡烛确实画了」, 而不是只看函数没抛错
-const draw = { clear:0, fillRect:0, strokeRect:0, fillText:0, stroke:0, arc:0 };
-function drawReset(){ Object.keys(draw).forEach(k=>draw[k]=0); }
+// texts 记录每次 fillText 的文本与当时 fillStyle, 用于断言刻度标注内容/着色
+const draw = { clear:0, fillRect:0, strokeRect:0, fillText:0, stroke:0, arc:0, texts:[] };
+function drawReset(){ Object.keys(draw).forEach(k=>draw[k]=0); draw.texts = []; }
 const ctx2d = {
   clearRect(){ draw.clear++; }, fillRect(){ draw.fillRect++; }, strokeRect(){ draw.strokeRect++; },
   beginPath(){}, moveTo(){}, lineTo(){}, stroke(){ draw.stroke++; },
   setLineDash(){}, arc(){ draw.arc++; }, fill(){}, save(){}, restore(){}, closePath(){},
-  fillText(){ draw.fillText++; }, measureText(t){ return {width: String(t).length*6}; },
+  fillText(t,x,y){ draw.fillText++; draw.texts.push({t:String(t), c:String(this.fillStyle),
+    x:x, y:y, a:String(this.textAlign), b:String(this.textBaseline)}); },
+  measureText(t){ return {width: String(t).length*6}; },
   fillStyle:'', strokeStyle:'', lineWidth:1, font:'', textAlign:'', textBaseline:''
 };
 const cache = {};
@@ -247,6 +252,68 @@ function ck(label, cond, extra){
   fire(cvEl, 'click', {clientX:xT, clientY:150});
   ck('分时视图命中第 4 点', api.getTr().mark === 3, String(api.getTr().mark));
   ck('分时量与日K量互不干扰', api.getKl().mark === null);
+
+  console.log('\n== ⑪ 分时右轴标注「价格 + 涨跌幅%」 ==');
+  drawReset();
+  api.drawTrends({code:'000993', name:'闽东电力', preClose:13.88, points:pts2}, '闽东电力');
+  const tTxt = draw.texts.map(x=>x.t);
+  const pcts = tTxt.filter(t=>/%$/.test(t));
+  ck('绘制 4 条涨跌幅刻度', pcts.length === 4, pcts.join(' '));
+  ck('价格刻度仍保留(4 条)', tTxt.filter(t=>/^\d+\.\d{2}$/.test(t)).length === 4, tTxt.join(' '));
+  ck('涨跌幅格式为 +x.xx% / -x.xx%', pcts.every(t=>/^[+-]?\d+\.\d{2}%$/.test(t)), pcts.join(' '));
+  ck('含相对昨收为正的刻度', pcts.some(t=>/^\+\d/.test(t)), pcts.join(' '));
+  ck('含相对昨收为负的刻度', pcts.some(t=>/^-/.test(t)), pcts.join(' '));
+  ck('无 "-0.00%" 伪负零', pcts.indexOf('-0.00%') < 0, pcts.join(' '));
+  const redP = draw.texts.filter(x=>/%$/.test(x.t) && x.c === '#f23645').map(x=>x.t);
+  const grnP = draw.texts.filter(x=>/%$/.test(x.t) && x.c === '#2bbf6a').map(x=>x.t);
+  ck('高于昨收的刻度着红', redP.length >= 1, redP.join(' '));
+  ck('低于昨收的刻度着绿', grnP.length >= 1, grnP.join(' '));
+  ck('价格刻度着灰(不与涨跌幅混色)',
+     draw.texts.filter(x=>/^\d+\.\d{2}$/.test(x.t) && x.c === '#6f7d97').length === 4,
+     draw.texts.map(x=>x.t+':'+x.c).join(' '));
+
+  drawReset();
+  api.drawKline(klFix, '闽东电力');
+  ck('日K 右轴不标注涨跌幅(维持单行价格)',
+     draw.texts.filter(x=>/%$/.test(x.t)).length === 0,
+     draw.texts.map(x=>x.t).join(' '));
+
+  console.log('\n== ⑫ 右轴标注像素级几何校验(不越界 / 不压量区) ==');
+  // 取实测标的做几何校验: 苏州天脉 301626, 昨收 299.00, 盘中 297.33~321.55
+  const realPts = [
+    {t:'2026-09-16 09:30', price:305.00, avg:305.00, o:305.00, vol:1000},
+    {t:'2026-09-16 10:30', price:297.33, avg:302.10, o:303.00, vol:1200},
+    {t:'2026-09-16 11:30', price:312.00, avg:305.50, o:308.00, vol:900},
+    {t:'2026-09-16 14:00', price:321.55, avg:310.20, o:316.00, vol:1500}
+  ];
+  drawReset();
+  api.drawTrends({code:'301626', name:'苏州天脉', preClose:299.00, points:realPts}, '苏州天脉');
+  const Gp = api.chartGeom(760, 440);
+  const tw = t => String(t).length * 6;            // 与 mock measureText 同口径
+  const isPx = t => /^\d+\.\d{2}$/.test(t), isPc = t => /^[+-]?\d+\.\d{2}%$/.test(t);
+  const axisAll = draw.texts.filter(x => isPx(x.t) || isPc(x.t));
+  const clip = [], overVol = [];
+  axisAll.forEach(x => {
+    const left = (x.a === 'right') ? x.x - tw(x.t) : x.x;
+    const right = left + tw(x.t);
+    const top = (x.b === 'bottom') ? x.y - 10 : ((x.b === 'top') ? x.y : x.y - 5);
+    const bot = top + 10;
+    if(left < 0 || right > 760 || top < 0 || bot > 440) clip.push(x.t + '[' + left.toFixed(0) + ',' + top.toFixed(0) + ']');
+    if(bot > Gp.volTop && top < Gp.volBot) overVol.push(x.t);
+  });
+  ck('轴标注 4 价格 + 4 涨跌幅', axisAll.length === 8,
+     'px=' + axisAll.filter(x=>isPx(x.t)).length + ' pct=' + axisAll.filter(x=>isPc(x.t)).length);
+  ck('全部落在画布内(无裁切)', clip.length === 0, clip.join(' '));
+  ck('不与成交量区重叠', overVol.length === 0, overVol.join(' '));
+  ck('涨跌幅文本右边界留有余量(<=760)',
+     Math.max.apply(null, draw.texts.filter(x=>isPc(x.t)).map(x=>x.x + tw(x.t))) <= 760,
+     String(Math.max.apply(null, draw.texts.filter(x=>isPc(x.t)).map(x=>x.x + tw(x.t)))));
+  ck('涨跌幅与价格同一水平位(价格在上)',
+     draw.texts.filter(x=>isPc(x.t)).every(pc => {
+       const px = draw.texts.find(x=>isPx(x.t) && Math.abs(x.x - pc.x) < 0.01
+                                      && Math.abs(pc.y - x.y - 3) < 0.01);
+       return !!px;
+     }), '需成对出现');
 
   console.log('\n' + (fail ? '[FAIL] 失败 ' + fail + ' 项' : '[OK] 全部通过'));
   process.exit(fail ? 1 : 0);
