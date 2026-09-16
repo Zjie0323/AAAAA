@@ -246,7 +246,7 @@ def main():
     agg = {name: {"p5": 0, "p5_hit": 0, "p5_touch": 0, "p10": 0, "p10_hit": 0,
                   "p10_touch": 0, "b5": 0, "bh5": 0, "b10": 0, "bh10": 0,
                   "picks": []} for name, _ in VARIANTS}
-    base = {"n": 0, "hit": 0, "touch": 0, "sealed": 0}
+    base = {"n": 0, "hit": 0, "touch": 0, "sealed": 0, "buy_n": 0, "buy_hit": 0}
     day_rows = []
 
     for d in DAYS:
@@ -274,6 +274,10 @@ def main():
         base["hit"] += pool_hit
         base["touch"] += pool_touch
         base["sealed"] += sum(1 for s in stocks if s["code"] in n_sealed)
+        # 基准必须与方案同口径: 方案率的分母是「可买票」, 基准就不能用「全部票」
+        base["buy_n"] += sum(1 for s in stocks if s["code"] not in n_sealed)
+        base["buy_hit"] += sum(1 for s in stocks
+                               if s["code"] in n_zt and s["code"] not in n_sealed)
 
         line = []
         for name, keyfn in VARIANTS:
@@ -314,31 +318,36 @@ def main():
     w("汇总 (%d 个交易日)" % len(day_rows))
     w("=" * 78)
     bn = base["n"] or 1
-    w("全池基准: %d 只票 | 次日晋级 %d (%.1f%%) | 次日触板 %d (%.1f%%)"
-      % (base["n"], base["hit"], base["hit"] * 100.0 / bn,
-         base["touch"], base["touch"] * 100.0 / bn))
+    bbn = base["buy_n"] or 1
+    base_rate_all = base["hit"] * 100.0 / bn        # 全池晋级率(含买不进的票)
+    base_rate_buy = base["buy_hit"] * 100.0 / bbn   # 全池可买晋级率(与方案率同口径)
+    w("全池基准: %d 只票 | 次日晋级 %d | 次日触板 %d"
+      % (base["n"], base["hit"], base["touch"]))
+    w("  晋级率(全部票)   %.1f%%" % base_rate_all)
+    w("  可买晋级率       %.1f%% (%d/%d)   ← lift 基准必须用这个(与方案率同口径)"
+      % (base_rate_buy, base["buy_hit"], base["buy_n"]))
     w("")
-    w("%-26s %14s %14s %10s" % ("方案", "top5 晋级", "top5 触板", "vs全池"))
+    w("%-26s %14s %14s %18s" % ("方案", "top5 晋级", "top5 触板", "vs全池(晋级率口径)"))
     w("-" * 78)
     for name, _ in VARIANTS:
         a = agg[name]
         p5 = a["p5"] or 1
         r5 = a["p5_hit"] * 100.0 / p5
         t5 = a["p5_touch"] * 100.0 / p5
-        lift = r5 - base["hit"] * 100.0 / bn
-        w("%-26s %8d/%-3d %5.1f%% %8.1f%% %+9.1fpct"
+        lift = r5 - base_rate_all
+        w("%-26s %8d/%-3d %5.1f%% %8.1f%% %+15.1fpct"
           % (name, a["p5_hit"], p5, r5, t5, lift))
 
     w("")
-    w("%-26s %14s %14s %10s" % ("方案", "top10 晋级", "top10 触板", "vs全池"))
+    w("%-26s %14s %14s %18s" % ("方案", "top10 晋级", "top10 触板", "vs全池(晋级率口径)"))
     w("-" * 78)
     for name, _ in VARIANTS:
         a = agg[name]
         p10 = a["p10"] or 1
         r10 = a["p10_hit"] * 100.0 / p10
         t10 = a["p10_touch"] * 100.0 / p10
-        lift = r10 - base["hit"] * 100.0 / bn
-        w("%-26s %8d/%-3d %5.1f%% %8.1f%% %+9.1fpct"
+        lift = r10 - base_rate_all
+        w("%-26s %8d/%-3d %5.1f%% %8.1f%% %+15.1fpct"
           % (name, a["p10_hit"], p10, r10, t10, lift))
 
     # ---- 可交易性口径: 剔除次日 9:25 竞价即封死(买不进)的票 ----
@@ -349,21 +358,25 @@ def main():
     w("全池中「次日竞价封死」= %d/%d (%.1f%%) -- 这类票即使晋级也无法在次日买入"
       % (base["sealed"], base["n"], base["sealed"] * 100.0 / bn))
     w("")
-    w("%-26s %12s %12s %16s" % ("方案", "可买只数", "其中晋级", "可买晋级率"))
+    w("%-26s %12s %12s %14s %18s"
+      % ("方案", "可买只数", "其中晋级", "可买晋级率", "vs全池(可买口径)"))
     w("-" * 78)
     for name, _ in VARIANTS:
         a = agg[name]
         b5 = a["b5"] or 1
-        w("%-26s %6d/%-3d %10d      %10.1f%%"
-          % (name, a["b5"], a["p5"], a["bh5"], a["bh5"] * 100.0 / b5))
+        r5b = a["bh5"] * 100.0 / b5
+        w("%-26s %6d/%-3d %10d      %10.1f%% %+15.1fpct"
+          % (name, a["b5"], a["p5"], a["bh5"], r5b, r5b - base_rate_buy))
     w("")
-    w("%-26s %12s %12s %16s" % ("方案", "可买只数(t10)", "其中晋级", "可买晋级率"))
+    w("%-26s %12s %12s %14s %18s"
+      % ("方案", "可买只数(t10)", "其中晋级", "可买晋级率", "vs全池(可买口径)"))
     w("-" * 78)
     for name, _ in VARIANTS:
         a = agg[name]
         b10 = a["b10"] or 1
-        w("%-26s %6d/%-3d %10d      %10.1f%%"
-          % (name, a["b10"], a["p10"], a["bh10"], a["bh10"] * 100.0 / b10))
+        r10b = a["bh10"] * 100.0 / b10
+        w("%-26s %6d/%-3d %10d      %10.1f%% %+15.1fpct"
+          % (name, a["b10"], a["p10"], a["bh10"], r10b, r10b - base_rate_buy))
 
     # ---- 显著性: 各方案 vs 现行 A ----
     w("")
