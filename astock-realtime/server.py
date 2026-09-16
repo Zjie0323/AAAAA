@@ -572,10 +572,13 @@ def _fbt_to_hhmm(fbt):
 
 
 def parse_pool_item(it):
-    """解析专题池单条 -> 统一结构(含连板/封板/封单字段).
+    """解析专题池单条 -> 统一结构(含连板/封板/封单/市值字段).
     新接口字段: c 代码, n 名称, p 最新价(毫), zdp 涨跌幅, amount 成交额(元),
     hs 换手率, lbc 连板数, fbt/lbt 首次/最后封板时间(秒), fund 封单金额(元),
-    zbc 炸板次数, hybk 行业, zttj 涨停统计."""
+    zbc 炸板次数, hybk 行业, zttj 涨停统计{days,ct}, ltsz 流通市值(元),
+    tshare 总市值(元).
+    ★ 市值(ltsz)必须透传: 封单额绝对值是弱因子(r≈0.21), 封单/流通比才是有效
+      相对量纲因子(r≈0.32); 早期版本漏解析 ltsz 导致智能推荐排序只能用绝对值。"""
     code = str(it.get("c") or it.get("t") or it.get("f12") or "")
     name = str(it.get("n") or it.get("f14") or "")
     # 价格 p 接口返回毫(0.001元); amount/fund 已是元
@@ -587,10 +590,39 @@ def parse_pool_item(it):
     lbt_sec = it.get("lbt")
     fbt_ts = _fbt_to_hhmm(fbt_sec)
     zbc = it.get("zbc")
-    # 一字板推断: 开盘即封死(fbt==lbt 且常在竞价 09:25) 且 未炸板
-    znh = False
+    # 涨停统计 zttj = {"days": N, "ct": M}  ->  N天M板
+    zttj = it.get("zttj")
+    zt_days = zt_ct = None
+    if isinstance(zttj, dict):
+        zt_days = zttj.get("days")
+        zt_ct = zttj.get("ct")
+    # 流通市值/总市值(元): 封单/流通比 等相对量纲因子的分母
+    ltsz = it.get("ltsz")
+    ltsz = float(ltsz) if isinstance(ltsz, (int, float)) and ltsz > 0 else None
+    tshare = it.get("tshare")
+    tshare = float(tshare) if isinstance(tshare, (int, float)) and tshare > 0 else None
+    # 封单强度 = 封单金额 / 流通市值(百分比); 无量纲, 可跨票跨日横向比较
+    camount = it.get("fund") or it.get("camount")
+    seal_ratio = None
+    if isinstance(camount, (int, float)) and camount > 0 and ltsz:
+        seal_ratio = camount / ltsz * 100.0
+    # ★ 封板形态(两个口径必须分开, 早期把二者混为一谈):
+    #   sealed_solid = 封板后全天未开板(fbt==lbt 且 zbc==0). 注意这包含「10:35 才封板
+    #     然后死守到收盘」的票, 它并不是一字板, 开盘时完全买得进。
+    #   yizi = 真一字板(fbt<=09:30:00 且 zbc==0), 开盘即以涨停价封死, 竞价买不进。
+    # 实测 548 个样本: 旧口径判出 239 只「一字板」, 其中 201 只(84%)实为盘中封板死守,
+    # 被错误标注「一字加速·买不进」并倒扣 3 分 -> 推荐页出现明显错标。
+    sealed_solid = False
     if zbc == 0 and fbt_sec is not None and lbt_sec is not None and fbt_sec == lbt_sec:
-        znh = True
+        sealed_solid = True
+    # znh 字段保留原口径仅供兼容, 新代码请用 yizi / sealed_solid
+    znh = sealed_solid
+    yizi = False
+    try:
+        if zbc == 0 and fbt_sec is not None and int(fbt_sec) <= 93000:
+            yizi = True
+    except Exception:
+        yizi = False
     # 炸板: 炸板次数>0
     zs = False
     if isinstance(zbc, int) and zbc > 0:
@@ -606,10 +638,18 @@ def parse_pool_item(it):
         "limit": limit_pct(code, name),
         "board": board_of(code, name),
         "lbc": lbc,                       # 连板天数(整数, 首板=1)
-        "fbt": fbt_ts,                    # 首次封板时间戳(Unix秒)
-        "camount": it.get("fund") or it.get("camount"),  # 封单金额(元)
+        "fbt": fbt_ts,                    # 首次封板时间戳(Unix秒, 形如 "09:25")
+        "fbt_raw": fbt_sec,               # 首次封板原始秒数(排序用, 越小越早封)
+        "camount": camount,               # 封单金额(元)
         "cnum": it.get("cnum"),           # 封单量(新接口无此字段, 保留兼容)
-        "znh": znh,                       # 是否一字板
+        "ltsz": ltsz,                     # 流通市值(元)
+        "tshare": tshare,                 # 总市值(元)
+        "seal_ratio": seal_ratio,         # 封单/流通市值(%)  无量纲相对因子
+        "yizi": yizi,                     # 真一字板(09:30 前封死, 竞价买不进)
+        "sealed_solid": sealed_solid,     # 封板后全天未开板(含盘中封板后死守)
+        "zt_days": zt_days,               # 涨停统计: N天
+        "zt_ct": zt_ct,                   # 涨停统计: M板
+        "znh": znh,                       # 【兼容别名】== sealed_solid, 非真一字板
         "zs": zs,                         # 是否炸板
         "zbc": zbc,                       # 炸板次数(原始)
         "hybk": it.get("hybk") or "",     # 行业
@@ -1009,10 +1049,17 @@ def _score_stock(s, hy_cnt):
         sc -= 3
         reasons.append("%d连板·高位一致回避" % lbc)
 
-    # 2) 一字板/加速: 买不进且高标死于一致
-    if znh:
+    # 2) 封板形态扣分(合计仍是 -3, 与历史行为一致; 仅把「一字板」与「盘中封板后
+    #    全天未开板」两个完全不同的形态分开标注, 避免出现「10:35 才封板却标注
+    #    一字加速·买不进」的错标)
+    yizi = bool(s.get("yizi"))
+    sealed_solid = bool(s.get("sealed_solid")) or znh
+    if yizi:
         sc -= 3
-        reasons.append("一字加速·买不进")
+        reasons.append("一字板·竞价封死买不进")
+    elif sealed_solid:
+        sc -= 3
+        reasons.append("封板后全天未开板·一致性过强")
 
     # 3) 炸板
     if zs and zbc >= 2:
@@ -1034,15 +1081,19 @@ def _score_stock(s, hy_cnt):
             sc -= 1
             reasons.append("换手%.1f%%·缩量" % hs)
 
-    # 5) 封单
+    # 5) 封单 -- 绝对值分档(历史口径, 未改), 但把量纲可比的「封单/流通比」一并
+    #    标注出来: 同样是 3 亿封单, 流通 40 亿的票(7.5%) 比流通 400 亿的票(0.75%)
+    #    强度高一个数量级, 仅看绝对额会系统性偏向大盘股。
+    sr = s.get("seal_ratio")
     if fund is not None and fund > 0:
         yi = fund / 1e8
+        tail = "%.2f亿(占流通%.2f%%)" % (yi, sr) if sr else "%.1f亿" % yi
         if yi >= 3:
             sc += 2
-            reasons.append("封单%.1f亿" % yi)
+            reasons.append("封单%s" % tail)
         elif yi >= 1:
             sc += 1
-            reasons.append("封单%.1f亿" % yi)
+            reasons.append("封单%s" % tail)
 
     # 6) 板块效应
     if hy_n >= 5:
@@ -1055,8 +1106,33 @@ def _score_stock(s, hy_cnt):
     return sc, reasons
 
 
-def score_pool(stocks, n=5):
-    """对任意股票池(今日/昨日)统一评分排序, 返回 top n items(含 score/reasons)."""
+def _rank_key(rank):
+    """排序键工厂. rank=None 为现行生产口径(行为与历史完全一致).
+    影子口径用于「同一天同一批票, 只换 tiebreaker」的对照实验, 不改变默认行为.
+
+    背景: 现行 tiebreaker = 封单额绝对值, 但它是弱因子(实测 r≈0.21); 封单/流通比
+    是更强的相对量纲因子(r≈0.32). 9 个复盘日影子对比(见 astock-screen/
+    _shadow_tiebreak.py)显示: 现行 top5「可买晋级率」16.3%, 低于全池基准 21.6%;
+    改用封单/流通比可显著抬升, 但样本仅 45 只(p≈0.07, 未达显著), 故默认不切换,
+    先以影子模式并行观察."""
+    if rank == "ratio":
+        # 保留打分, 仅把 tiebreaker 从「封单额」换成「封单/流通比」
+        return lambda x: (x[0], x[1].get("seal_ratio") or 0, x[1].get("camount") or 0)
+    if rank == "seal":
+        # 弃用打分, 纯封单/流通比; 剔除真一字板(买不进)与 5 板以上高位
+        def _seal(x):
+            s = x[1]
+            if s.get("yizi") or (s.get("lbc") or 1) >= 5:
+                return (-1.0, 0.0)
+            return (s.get("seal_ratio") or 0, 0.0)
+        return _seal
+    # 现行生产口径: (评分, 封单额绝对值)
+    return lambda x: (x[0], x[1].get("camount") or 0)
+
+
+def score_pool(stocks, n=5, rank=None):
+    """对任意股票池(今日/昨日)统一评分排序, 返回 top n items(含 score/reasons).
+    rank 为 None 时使用现行生产排序口径; 传入影子口径仅用于对照观察."""
     hy_cnt = {}
     for s in stocks:
         k = s.get("hybk") or "其他"
@@ -1065,7 +1141,7 @@ def score_pool(stocks, n=5):
     for s in stocks:
         sc, reasons = _score_stock(s, hy_cnt)
         scored.append((sc, s, reasons))
-    scored.sort(key=lambda x: (x[0], x[1].get("camount") or 0), reverse=True)
+    scored.sort(key=_rank_key(rank), reverse=True)
     items = []
     for sc, s, reasons in scored[:n]:
         items.append({
@@ -1074,20 +1150,24 @@ def score_pool(stocks, n=5):
             "camount": s["camount"], "turnover": s["turnover"],
             "hybk": s.get("hybk") or "", "board": s.get("board"),
             "score": sc, "reasons": reasons,
+            # 以下为量纲可比因子, 供前端展示封单强度/市值(不参与默认排序)
+            "ltsz": s.get("ltsz"), "seal_ratio": s.get("seal_ratio"),
+            "yizi": bool(s.get("yizi")), "sealed_solid": bool(s.get("sealed_solid")),
         })
     return items
 
 
-def build_recommend_payload(prev=False):
+def build_recommend_payload(prev=False, rank=None):
     """按《交易逻辑》从涨停池选推荐 5 只(分歧低吸观察池, 非追涨).
-    prev=True 时额外返回昨日推荐及其今日表现(对比用)."""
+    prev=True 时额外返回昨日推荐及其今日表现(对比用).
+    rank: None=现行生产排序; "ratio"/"seal" 为影子对照口径(不改变默认行为)."""
     _NOTE = "按《交易逻辑》量化：低位连板(2-3板)+充分换手+强板块+大封单优先；一字加速/高位一致/炸板回避。候选为分歧低吸观察池，非追涨建议。"
     if prev:
         # ---- 对比模式: 今日推荐 + 昨日推荐 + 昨日推荐今日表现 ----
         ts, stocks, fresh = get_cached("zt", _ZT_MAX_AGE)
-        today_items = score_pool(stocks or [], 5) if stocks else []
+        today_items = score_pool(stocks or [], 5, rank) if stocks else []
         y_stocks = get_prev_pool("zt")
-        y_items = score_pool(y_stocks, 5)
+        y_items = score_pool(y_stocks, 5, rank)
         prev_day = prev_trading_day()
         perf = {}
         codes = [x["code"] for x in y_items]
@@ -1104,15 +1184,16 @@ def build_recommend_payload(prev=False):
                          "yesterday": {"count": len(y_items), "items": y_items,
                                        "total": len(y_stocks), "perf": perf,
                                        "date": prev_day, "date_label": _td_label(prev_day)},
-                         "note": _NOTE}}
+                         "note": _NOTE, "rank": (rank or "camount")}}
     # ---- 默认: 今日推荐 ----
     ts, stocks, fresh = get_cached("zt", _ZT_MAX_AGE)
     if stocks is None:
         return 502, {"ok": False, "error": "数据尚未就绪（首次抓取中或接口持续不可达）"}
-    items = score_pool(stocks, 5)
+    items = score_pool(stocks, 5, rank)
     return 200, {"ok": True, "updated": int(ts), "stale": (not fresh),
                  "data": {"count": len(items), "items": items,
-                          "total": len(stocks), "note": _NOTE}}
+                          "total": len(stocks), "note": _NOTE,
+                          "rank": (rank or "camount")}}
 
 
 def build_stock_payload(kind):
@@ -1717,7 +1798,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/recommend":
                 q = urllib.parse.parse_qs(self.path.split("?")[1]) if "?" in self.path else {}
                 prev = (q.get("prev") or [""])[0] == "1"
-                code, payload = build_recommend_payload(prev=prev)
+                # rank 仅用于影子对照观察(同批票只换 tiebreaker), 缺省=现行口径
+                rk = (q.get("rank") or [""])[0].strip().lower()
+                rk = rk if rk in ("ratio", "seal") else None
+                code, payload = build_recommend_payload(prev=prev, rank=rk)
                 self._send(code, payload)
                 return
             if path == "/api/limit_prev":

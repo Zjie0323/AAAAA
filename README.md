@@ -67,6 +67,7 @@
 │   ├── refresh_watch.py             #   刷新入口（盘后定时任务调用）
 │   ├── gen_review.py                #   盘后复盘报告
 │   ├── win_verify.py                #   分档胜率验证（累积样本）
+│   ├── shadow_tiebreak.py           #   排序因子影子对比（换 tiebreaker 的对照实验）
 │   ├── limit_up.json                #   涨停基因池（预置，325 KB，入库）
 │   ├── raw_stats.json               #   code→name 映射（1.3 MB，入库）
 │   └── kdata/                       #   1194 只个股日K缓存（22 MB，**不入库**）
@@ -124,6 +125,28 @@ cd astock-screen
 python refresh_watch.py            # 交易日盘后执行
 python refresh_watch.py --force    # 忽略休市判定强制跑
 ```
+
+### 排序因子影子对比（策略调参前必跑）
+
+`score_pool()` 的 tiebreaker 决定了「同分票谁进 top5」。改它等于改推荐结果，
+因此**必须先做影子对比**再上线：
+
+```bash
+cd astock-screen
+python shadow_tiebreak.py          # 逐日抓 zt/zb 专题池 → _phist/ 缓存 → 断点续跑
+```
+
+指标口径（按用户实际关切排序）：
+
+| 指标 | 定义 | 说明 |
+|---|---|---|
+| **可买晋级率** | 次日进涨停池 且 次日非 9:25 竞价封死 | **主口径**，剔除了根本买不进的票 |
+| 晋级率 | 次日进涨停池 | 未剔除不可买样本，会高估 |
+| 触板率 | 次日进涨停池 或 次日炸板池 | 反映「曾涨停」强度 |
+| vs 全池 | 相对「当日涨停池全量」的超额 | **负值 = 策略没有 alpha** |
+
+> ⚠️ 结论须过统计显著性（Fisher 精确检验）。多方案同批数据择优存在多重比较
+> 问题：试 10 个方案时，最优那个天然偏高，p 值需按比较次数校正后再判断。
 
 ---
 
