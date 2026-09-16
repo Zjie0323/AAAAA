@@ -30,6 +30,11 @@ REALTIME = os.path.join(HERE, "..", "astock-realtime")
 sys.path.insert(0, HERE)
 import em  # noqa: E402
 
+# server.py 是以「文件路径」exec_module 载入的, 它内部的普通 import(如 em_changes)
+# 要靠 sys.path 解析. 不把 astock-realtime 加进来, 这些 import 会静默降级为 None.
+if REALTIME not in sys.path:
+    sys.path.insert(0, REALTIME)
+
 # ---- 载入 astock-realtime/server.py 的解析与打分逻辑(唯一真源, 不复制实现) ----
 spec = importlib.util.spec_from_file_location("rt_server", os.path.join(REALTIME, "server.py"))
 rt = importlib.util.module_from_spec(spec)

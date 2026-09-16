@@ -63,11 +63,13 @@
 │   ├── live_limit.py                #   抓取当日涨停 / 炸板专题池
 │   ├── limit_up.py                  #   重算历史涨停基因池（读 kdata/）
 │   ├── gen_tomorrow.py              #   生成次日竞价观察名单
-│   ├── reco_engine.py               #   智能推荐引擎（六维分 / 赚钱效应分 / 买点门控）
+│   ├── reco_engine.py               #   竞价观察推荐引擎（六维分 / 赚钱效应分 / 买点门控）
 │   ├── refresh_watch.py             #   刷新入口（盘后定时任务调用）
 │   ├── gen_review.py                #   盘后复盘报告
 │   ├── win_verify.py                #   分档胜率验证（累积样本）
 │   ├── shadow_tiebreak.py           #   排序因子影子对比（换 tiebreaker 的对照实验）
+│   ├── shadow_log.py                #   智能推荐排序口径 · 前向影子记录
+│   ├── shadow_log.json              #   影子记录累积数据（入库，长期证据链）
 │   ├── limit_up.json                #   涨停基因池（预置，325 KB，入库）
 │   ├── raw_stats.json               #   code→name 映射（1.3 MB，入库）
 │   └── kdata/                       #   1194 只个股日K缓存（22 MB，**不入库**）
@@ -147,6 +149,52 @@ python shadow_tiebreak.py          # 逐日抓 zt/zb 专题池 → _phist/ 缓�
 
 > ⚠️ 结论须过统计显著性（Fisher 精确检验）。多方案同批数据择优存在多重比较
 > 问题：试 10 个方案时，最优那个天然偏高，p 值需按比较次数校正后再判断。
+
+### 并行影子记录（前向盲测，决策前必看）
+
+影子回测是在**已经看过的历史**上挑方案，天然乐观。因此候选口径不直接上线，
+而是挂成影子**并行记录**，等它在"还没被看见的未来"上跑够样本再决定：
+
+```bash
+cd astock-screen
+python shadow_log.py daily      # 盘后：结算上一交易日 + 记录今日（幂等）
+python shadow_log.py backfill    # 一次性回填历史（标为 in-sample）
+python shadow_log.py report      # 只看报告，不写数据
+```
+
+已挂到两条刷新入口（`refresh_watch.py` 与看板刷新按钮），**触发名单刷新即同步记录**；
+影子记录失败不影响名单刷新（best-effort）。
+
+| 产物 | 说明 |
+|---|---|
+| `shadow_log.json` | 累积记录（**入库**）：每日全池每只票的特征 + 次日晋级/触板/竞价封死 |
+| `_shadow_log_report.txt` | 文本报告（运行时产物） |
+| `_shadow_log_report.html` | 可视化报告（运行时产物） |
+
+三个关键设计：
+
+1. **记录的是全池特征，不是 top5** —— 因此日后任何新方案都能**离线复算**，
+   不必重新抓数，也不受 `_score_stock` 打分逻辑变更影响。
+2. **样本分组统计**：`in-sample`（回填历史，已参与挑方案）与 `forward`（前向盲测）
+   分开算，**只有 forward 样本具备决策效力**；前向不足 10 个交易日时，任何差异
+   都不足以支撑切换生产排序。
+3. **同源**：排序键与池缓存直接复用 `shadow_tiebreak.py`，不复制实现，避免口径漂移。
+
+用法上两条护栏：**15:05 前拒绝记录**（盘中涨停池仍在变动，记了会失真）、
+**次日未收盘拒绝结算**（否则会拿盘中池子判定"次日是否晋级"）。
+
+#### 定时触发
+
+Windows 侧已注册计划任务 **`AStock-ShadowLog-1510`**（工作日 15:10，开启
+`StartWhenAvailable` 以便错过开机时间后补跑），入口 `astock-screen/run_shadow_log.bat`：
+
+```powershell
+Get-ScheduledTask -TaskName "AStock-ShadowLog-1510" | Select-Object TaskName,State   # 查看
+Unregister-ScheduledTask -TaskName "AStock-ShadowLog-1510" -Confirm:$false          # 卸载
+```
+
+> `schtasks.exe` 在本机被安全策略黑名单拦截（`PROGRAM BLOCKED BY SECURITY POLICY`），
+> 注册/查询一律走 PowerShell cmdlet（`New-ScheduledTaskAction` + `Register-ScheduledTask`）。
 
 ---
 

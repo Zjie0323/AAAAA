@@ -640,6 +640,7 @@ def parse_pool_item(it):
         "lbc": lbc,                       # 连板天数(整数, 首板=1)
         "fbt": fbt_ts,                    # 首次封板时间戳(Unix秒, 形如 "09:25")
         "fbt_raw": fbt_sec,               # 首次封板原始秒数(排序用, 越小越早封)
+        "lbt_raw": lbt_sec,               # 最后封板原始秒数(与 fbt_raw 对称; 等值=封后未开板)
         "camount": camount,               # 封单金额(元)
         "cnum": it.get("cnum"),           # 封单量(新接口无此字段, 保留兼容)
         "ltsz": ltsz,                     # 流通市值(元)
@@ -1676,6 +1677,8 @@ def _run_refresh_watch():
         steps.append(("重算历史涨停基因池(limit_up)", [py, "limit_up.py"]))
     steps.append(("拉取今日收盘涨停快照(live_limit --fetch)", [py, "live_limit.py", "--fetch"]))
     steps.append(("生成明日竞价观察名单(gen_tomorrow)", [py, "gen_tomorrow.py"]))
+    # 影子记录: 固化今日智能推荐各排序口径的选股 + 结算上一交易日表现(best-effort)
+    steps.append(("影子记录(智能推荐排序口径)", [py, "shadow_log.py", "daily"]))
     REFRESH_WATCH["log"] = ""
     try:
         for label, cmd in steps:
