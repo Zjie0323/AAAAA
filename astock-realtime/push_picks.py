@@ -244,7 +244,9 @@ def load_picks(target: date | None = None, board: str = LOCAL_BOARD) -> tuple[li
         return j.get("picks", []), {"src": f"定盘快照 {snap.name}",
                                     "frozen_at": j.get("frozen_at"),
                                     "mode_name": j.get("mode_name"),
-                                    "mood": j.get("mood"), "date_label": j.get("date_label")}
+                                    "mood": j.get("mood"), "date_label": j.get("date_label"),
+                                    "exit_note": j.get("exit_note"),
+                                    "exit_rule": j.get("exit_rule")}
     st, j = http_json(f"{board}/api/bid_watch", timeout=25)
     if st == 200 and isinstance(j, dict):
         data = j.get("data") or {}
@@ -253,7 +255,11 @@ def load_picks(target: date | None = None, board: str = LOCAL_BOARD) -> tuple[li
             return picks, {"src": f"实时接口 {board}/api/bid_watch",
                            "frozen_at": data.get("frozen_at"),
                            "mode_name": data.get("mode_name"),
-                           "mood": data.get("mood"), "date_label": data.get("date_label")}
+                           "mood": data.get("mood"), "date_label": data.get("date_label"),
+                           # 实时接口把 exit_* / pick_rule 放在**顶层**（由 base_meta 合并而来），
+                           # 不在 data 里 —— 两个分支取法不同是接口形状决定的，勿统一。
+                           "exit_note": data.get("exit_note") or j.get("exit_note"),
+                           "exit_rule": j.get("exit_rule")}
     raise SystemExit(f"取不到 TOP3：{snap.name} 不存在，且 {board}/api/bid_watch 无 picks"
                      f"（HTTP {st}）。请确认看板已启动或换 --date。")
 
@@ -392,7 +398,7 @@ def build_compact(picks: list, meta: dict, fields: dict) -> list[dict]:
 #   实测每只 17 字符、最坏 19 字符，均在 thing 的 20 字符上限内。
 # ---------------------------------------------------------------------------
 _BUY_MARK = {
-    "gold": "买",   # 低开 -4~-1%：唯一正期望区间(+2.50%、胜率62%)
+    "gold": "买",   # 低开 -4~-1%：历史最强档(+2.50%、胜率62%)，近期同档实测 +0.08%(缩水约1/30)
     "deep": "慎",   # 深低开 <-4%：需翻红确认
     "mid":  "观",   # 小高开 1~5%
     "flat": "观",   # 平开 0~1%
@@ -400,10 +406,19 @@ _BUY_MARK = {
     "high": "弃",   # 高开 5~9.8%
     "yz":   "弃",   # 顶一字 >=9.8%，买不进
 }
+_VETO_MARK = "避"    # 放量下跌(竞价量比≥3.5 且低开)：实测该档 -2.28%/胜率33%，已降位
 
 
 def _slot_mark(p: dict) -> str:
-    """买点标记（单字，避免挤占名称空间）。"""
+    """买点标记（单字，避免挤占名称空间）。
+
+    ⚠️ 它只表达「仓位/买不买」的参考提示，**不再决定推不推** —— 2026-09-22 起推送
+    改为「不空仓 + 赚钱效应(win_adj) 排序 + 仅对放量下跌降位」，任何单一门控都不能
+    把推送清空。此前 15/15 条票被判「不可买」却仍全部推出去，正是「文案与裁决打架」
+    的根源，已在 rt/bidwatch.py 的 _pick_key 里改为分级降位。
+    """
+    if p.get("veto"):
+        return _VETO_MARK
     code = p.get("buy_code")
     if code in _BUY_MARK:
         return _BUY_MARK[code]
@@ -426,10 +441,21 @@ def _slot_text(p: dict) -> str:
 
 
 def _tip_text(meta: dict, picks: list, override: str | None = None) -> str:
-    """买点提示 = [情绪标签·]只买低开-4~-1%，最长 15 字符。"""
+    """提示文案 = [情绪标签·]卖点纪律，最长 15 字符。
+
+    2026-09-22 由「只买低开-4~-1%」改为**卖点纪律**，两条理由：
+      ① 旧文案是「买点门槛」，而推送票定盘时 gap 恒为负（-1%~-4%），auction_judge
+         一律判「强转弱·竞价清」—— 文案与推送内容自相矛盾；且该门槛由 buy_zone 单独
+         表达、与 auction_judge 实测互斥 14/15 条（同时 buy=False 且 buy_ok=True），
+         挂在提示位上只会误导。
+      ② 策略此前**只定义买点、从未定义卖点**。同批样本同口径(n=6)实测：
+         当日收盘卖 +1.47% / 次日开盘卖 +1.69% / 次日收盘卖 +3.00%
+         → 隔夜段才是超额收益来源，卖点纪律比买点门槛更该占这个字段。
+    文案优先级：命令行 --tip 覆盖 > 快照 meta.exit_note（由 reco_engine.EXIT_NOTE 下发）> 兜底。
+    """
     if override:
         return clip(override)
-    base = "只买低开-4~-1%"
+    base = str(meta.get("exit_note") or "T+1收盘前卖")
     blob = str(meta.get("mood") or "") + "".join(
         str(p.get("win_label") or "") for p in picks[:3])
     tag = ""

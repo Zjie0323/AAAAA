@@ -44,9 +44,13 @@ WATCH_JSON = os.path.join(DIR, "..", "astock-screen", "tomorrow_watch.json")
 sys.path.insert(0, os.path.join(DIR, "..", "astock-screen"))
 try:
     from reco_engine import (auction_judge, resolve_stage, volume_axiom, win_pick,
-                             yz_risk, buy_zone)
+                             yz_risk, buy_zone, vol_veto, VOL_VETO_RATIO,
+                             EXIT_RULE, EXIT_NOTE, EXIT_DESC)
 except Exception:
     auction_judge = resolve_stage = volume_axiom = win_pick = yz_risk = buy_zone = None
+    vol_veto = None
+    VOL_VETO_RATIO = 3.5
+    EXIT_RULE, EXIT_NOTE, EXIT_DESC = "T+1", "T+1收盘前卖", ""
 
 # 盘口/个股异动实时采集模块(与 quote.eastmoney.com/changes 同源)
 #   职责: 交易时段后台按节拍采集异动明细流 -> 环形缓冲(seq 游标) -> /api/changes 增量输出
@@ -1459,6 +1463,25 @@ def start_freeze_scheduler():
     threading.Thread(target=_loop, daemon=True).start()
 
 
+def _pick_key(r):
+    """TOP3 精选排序键 —— 2026-09-22 改为「不空仓 + 赚钱效应优先」三级降位。
+
+    档位（数字越小越优先）：
+      0  可参与(win_ok) 且无「放量下跌」  -> 正常推
+      1  win_ok=False（一字买不进/深低开/退潮）但量能无异常 -> 仍可推（买不进收益=0 优于负期望）
+      2  放量下跌（vol_veto 命中）         -> 最后才用，仅当同批不足 3 只时垫底
+    旧键 `(not win_ok, -win_adj, …)` 让 win_ok 单独决定展示位，与下游 push_picks 的
+    buy 标记叠加后，用户收到的是策略自己判「不可买」的票（服务器 5 快照 15/15 条
+    buy=False 却全被推送）。改为分级降位后：任何单一门控都无法清空推送（不空仓），
+    赚钱效应分 win_adj 成为实际主排序键。与仓库 rt/bidwatch.py 保持同一口径。
+    """
+    return (1 if r.get("veto") else 0,
+            1 if not r.get("win_ok") else 0,
+            -(r.get("win_adj") or 0),
+            -(r.get("reco_score") or 0),
+            -(r.get("seal") or 0))
+
+
 def build_bid_watch_payload():
     """竞价观察名单 + 实时行情 + 买入提示. 名单由 gen_tomorrow.py 生成的 JSON 提供."""
     if not os.path.exists(WATCH_JSON):
@@ -1479,7 +1502,11 @@ def build_bid_watch_payload():
                  "stage_code": watch.get("stage_code"),
                  "stage_name": watch.get("stage_name"),
                  "stage_desc": watch.get("stage_desc"),
-                 "stage_color": watch.get("stage_color")}
+                 "stage_color": watch.get("stage_color"),
+                 # 2026-09-22 调整：推送策略（不空仓 + 赚钱效应排序 + 量比否决）+ 卖点纪律
+                 "pick_rule": "不空仓·按赚钱效应(win_adj)取 TOP3；仅对「放量下跌」降位，不做剔除",
+                 "vol_veto_ratio": VOL_VETO_RATIO,
+                 "exit_rule": EXIT_RULE, "exit_note": EXIT_NOTE, "exit_desc": EXIT_DESC}
     if not items:
         return 200, dict(base_meta, data={"count": 0, "buy": 0, "items": []})
     # 情绪周期阶段 code(供竞价裁决门控)
@@ -1566,6 +1593,15 @@ def build_bid_watch_payload():
                 _yz = {"ratio": None, "level": "未知", "color": "#94a3b8", "note": ""}
         else:
             _yz = {"ratio": None, "level": "未知", "color": "#94a3b8", "note": ""}
+        # 竞价量比否决(2026-09-22 实证): 低开 + 量比≥VOL_VETO_RATIO = 放量下跌·真出货。
+        # 只降位、不剔除 —— 见 _pick_key。gap_eff 为 None（盘后/未开盘）时一律不否决。
+        if vol_veto:
+            try:
+                _vt, _vt_reason = vol_veto(gap_eff, vol_ratio)
+            except Exception:
+                _vt, _vt_reason = False, ""
+        else:
+            _vt, _vt_reason = False, ""
         out.append({
             "code": x["code"], "name": x["name"], "ind": x.get("ind"),
             "cls": x["cls"], "cls_name": x["cls_name"],
@@ -1588,13 +1624,12 @@ def build_bid_watch_payload():
             "buy_code": _bz.get("code"), "buy_label": _bz.get("label"),
             "buy_color": _bz.get("color"), "buy_ok": _bz.get("buy"),
             "buy_note": _bz.get("note"),
+            # === 量比否决(放量下跌, 只降位不剔除) ===
+            "veto": _vt, "veto_reason": _vt_reason,
         })
     out.sort(key=lambda r: (not r["buy"], -(r["reco_score"] or 0), -(r["board"] or 0), -(r["seal"] or 0)))
-    # TOP3 精选: 先按 win_ok(可参与) 再按 win_adj 排序, 避免展示位被「买不进 / 追高」占据
-    ranked = sorted(out, key=lambda r: (not r.get("win_ok"),
-                                        -(r.get("win_adj") or 0),
-                                        -(r.get("reco_score") or 0),
-                                        -(r.get("seal") or 0)))
+    # TOP3 精选: 2026-09-22 起走 _pick_key 的「不空仓 + 赚钱效应优先」三级降位。
+    ranked = sorted(out, key=_pick_key)
     picks = ranked[:3]
     # 定盘精选: 用「今日开盘缺口」重跑形态门控 —— 与 9:25 竞价定盘等价。
     # 因此即便快照在 9:40 后才补定(当时页面未打开/服务重启), 结论依然是 9:25 的口径,
@@ -1627,9 +1662,31 @@ def build_bid_watch_payload():
                                "buy_note": _bz2["note"]})
                 except Exception:
                     pass
+            # 量比否决同样用「开盘缺口」重算；但只在**实时竞价/盘中**生效
+            # （与上面 gap_eff 同一道门）：pre/pre_open/closed 时该缺口不是竞价缺口，
+            # 据此否决会误伤 —— 09-16 那批 vol_ratio≈100 的占位值即属此类。
+            if vol_veto and phase in ("auction", "open"):
+                try:
+                    _vt2, _vt2r = vol_veto(g, r.get("vol_ratio"))
+                    rr.update({"veto": _vt2, "veto_reason": _vt2r})
+                except Exception:
+                    pass
+            else:
+                rr.update({"veto": False, "veto_reason": ""})
+            # 竞价裁决结果**回写 signal/action** —— 修 09-18 批的字段缺陷：
+            # 那批 gap 有值(-1.43/-2.85/-1.10)，signal 却仍是「待竞价」、
+            # action 仍是「名单已就绪；明早 9:15 集合竞价开始后…」。
+            if auction_judge:
+                try:
+                    _sg, _ac, _cl, _by = auction_judge(
+                        x["cls"], x.get("board"), g, phase, stage_code,
+                        x.get("reco_score") or 0, x.get("is_main"),
+                        vol_ratio=r.get("vol_ratio"))
+                    rr.update({"signal": _sg, "action": _ac, "color": _cl, "buy": _by})
+                except Exception:
+                    pass
             fz_rank.append(rr)
-        fz_rank.sort(key=lambda r: (not r.get("win_ok"), -(r.get("win_adj") or 0),
-                                    -(r.get("reco_score") or 0), -(r.get("seal") or 0)))
+        fz_rank.sort(key=_pick_key)
     freeze_picks = (fz_rank[:3] or picks)
     # 定盘: 9:25-9:30 首次拿到定盘 TOP3 即落盘(幂等), 全天保留
     maybe_freeze_picks(freeze_picks, base_meta)
@@ -1656,6 +1713,7 @@ def build_bid_watch_payload():
     now_hm = now_l.tm_hour * 100 + now_l.tm_min
     return 200, dict(base_meta,
                      data={"count": len(out), "buy": sum(1 for r in out if r["buy"]),
+                           "veto": sum(1 for r in out if r.get("veto")),
                            "items": out, "picks": picks, "picks_n": len(picks),
                            "frozen": frozen,
                            "freeze_window": in_freeze_window(now_hm),

@@ -10,28 +10,81 @@
 本模块被 gen_tomorrow.py（写入六维分/阶段）与 server.py（竞价裁决）共同引用，保证口径一致。
 """
 import time
+import os as _os, re as _re, json as _json, glob as _glob, datetime as _dt, subprocess as _sp
+
+
+# ============ 三套评分体系的职责边界（2026-09-18 补文档） ============
+# 同一批涨停票会经过三个打分函数，它们的权重方向**刻意不同**，因为目标不同。
+# 曾因缺此说明而被误读为「口径不一致的 bug」，故在此固定边界 —— 改动前先确认改的是哪一个：
+#
+#   1) _score_stock（server.py，累加制 ±3）—— 智能推荐的**选股**
+#      目标：找「分歧低吸」标的 → 因此**偏爱 2~3 板**(+3)、惩罚高位(≥5板 -3)。
+#      这是唯一的「选股」评分。
+#   2) intensity_six（本模块，百分制，board .25 / main .20）—— **强度持续性**
+#      目标：衡量「这波还能不能延续」→ 连板越高越强，但 ≥5 板已有折价(62)。
+#      用途：作为竞价信号的上游准入门槛（评分 <45 则其竞价信号不被采信）。
+#   3) win_score（本模块，百分制，seal .30 / ltsz .20）—— **赚钱效应排序**
+#      目标：按实测收益边际排「盯哪几只」→ 弱化几乎无效的 main(.08)，强化封单/流通盘。
+#
+# 对「板块/主线」维度的权重差异最大，这是设计而非疏漏：
+#   _score_stock 用同行业涨停家数(≥5家 +3)；intensity_six 给 is_main 权重 .20；
+#   win_score 仅 .08 —— 实测 main 的赚钱边际只有 +0.26%，六维里却占 .20，故刻意压低。
+#
+# 关键：「选股」与「买点」是正交的两件事 ——
+#   选哪几只 → win_score / _score_stock；  买不买 → buy_zone（竞价缺口分档）。
+#   不得混用：实测「当日涨幅榜」与「竞价买入收益」方向相反（缺口越大涨幅越好，但开盘买越亏）。
 
 
 # ============ 情绪周期五阶段 ============
 # code: (name, desc, color, 竞价系数k)
-# k 仅用于展示/门槛说明：该阶段下竞价买入的整体可信度。
+# k 的门控语义(2026-09-18 起)：**k<=0 的阶段一律空仓**。auction_judge 据此判定，
+#   不再硬编码阶段名 —— 这样 k 成为单一事实源，新增零 k 阶段自动获得空仓门控。
+#   修复前门控写的是 `code in ("bingdian","tuichao")`，与 k 字段重复表达同一条规则。
+# 档位口径（与 em.mood 的关系，两侧**刻意不同**，勿强行统一）：
+#   stage 是「打板择时」的粗糙分档：<10 冰点 / 10~29 启动 / 30~119 发酵 / ≥120 高潮；
+#   mood  是「盘面定性」的展示分档：<10 / 10~29 / 30~59 / 60~119 / ≥120 共 5 档。
+#   故 60~119 区间：stage 仍归「发酵」(该区间打板胜率仍高)，mood 显示「情绪偏暖」。
+#   ⚠️ 下列 desc 文案必须与 resolve_stage 的 tc 阈值逐字对应，否则会重演
+#      「文案写 30~60 只、实现却是 tc>=30」的描述与实现不一致。
 STAGES = {
     "bingdian": ("冰点", "涨停<10，打板期望为负，空仓等情绪修复",               "#1e8449", 0.0),
-    "qidong":   ("启动", "10~30只，试错期，只打最强主线/绝对核心",              "#2e86c1", 0.40),
-    "fajiao":   ("发酵", "30~60只，主线清晰，打板胜率最高",                     "#b9770e", 0.85),
-    "gaochao":  ("高潮", "≥120只，普涨次日必分化，只打最高辨识度龙头",          "#c0392b", 0.60),
+    "qidong":   ("启动", "涨停10~29只，试错期，只打最强主线/绝对核心",          "#2e86c1", 0.40),
+    "fajiao":   ("发酵", "涨停30~119只，主线清晰，打板胜率最高",                "#b9770e", 0.85),
+    "gaochao":  ("高潮", "涨停≥120只，普涨次日必分化，只打最高辨识度龙头",      "#c0392b", 0.60),
     "tuichao":  ("退潮", "高位爆量开板/连板断板，全面降仓回避",                  "#5f5e5a", 0.0),
 }
 
 
-def resolve_stage(tc, override=None):
-    """由涨停家数推导当前情绪阶段；override 可手动覆盖（已知退潮/高潮时传入）。"""
+def resolve_stage(tc, override=None, zb_tc=None):
+    """由涨停家数(+炸板率)推导当前情绪阶段；override 可手动覆盖（已知退潮/高潮时传入）。
+
+    退潮自动推导（2026-09-18 新增）：
+      修复前 STAGES 里的 tuichao **只能**由 override 返回，而生产链路上
+      gen_tomorrow.py 调用的是 resolve_stage(tc) —— 从不传 override，
+      于是 auction_judge 里「情绪退潮·空仓」这条门控形同虚设、永远不可能命中。
+      现补上基于盘面数据的推导：涨停家数仍有 30+（不是冰点）但炸板率 ≥40%
+      = 封板资金不坚决、高位一致转分歧，即退潮特征。
+    阈值 40% 与 em.mood 的「炸板率 ≥40% 极高」保持同一口径（单一事实源）；
+    且仅在 tc>=30 时判退潮 —— tc<30 本身已由 qidong/bingdian 覆盖，避免抢档。
+    炸板率 = zb / (zb + tc)，与 mood() 一致。
+    """
+    ensure_strategy()                       # 热重载: 策略文件变更无需重启
     if override in STAGES:
         return override, STAGES[override]
     try:
         tc = int(tc)
     except Exception:
         tc = 0
+    zb_ratio = None
+    if zb_tc is not None:
+        try:
+            zb_tc = int(zb_tc)
+            if zb_tc + tc > 0:
+                zb_ratio = zb_tc / float(zb_tc + tc) * 100.0
+        except Exception:
+            zb_ratio = None
+    if zb_ratio is not None and zb_ratio >= 40 and tc >= 30:
+        return "tuichao", STAGES["tuichao"]
     if tc >= 120:
         code = "gaochao"
     elif tc >= 30:
@@ -43,6 +96,18 @@ def resolve_stage(tc, override=None):
     return code, STAGES[code]
 
 
+def stage_k(stage_code):
+    """阶段 code -> 竞价系数 k；未知阶段返回 None。
+
+    门控统一入口（2026-09-18 新增）：所有「该阶段能不能参与」的判定都应当走
+    `k <= 0`，而不是硬编码阶段名。这样 k 成为**单一事实源** —— 新增零 k 阶段
+    自动获得空仓门控，不必在多处同步改（此前 auction_judge 与 win_pick 各写一遍
+    阶段名，改一处漏一处）。
+    """
+    st = STAGES.get(stage_code)
+    return None if st is None else st[3]
+
+
 # ============ 强度持续性六维 ============
 # 六维：连板高度 / 封单强度 / 主线板块 / 封板质量 / 流通盘适配 / 量能健康
 # 每维 0-100，加权得总分(0-100)。这是「智能推荐」的量化核心。
@@ -50,8 +115,20 @@ W = {"board": 0.25, "seal": 0.15, "main": 0.20, "zbc": 0.15, "ltsz": 0.10, "amt"
 
 
 def _d_board(b):
+    """连板高度维(0-100)。
+
+    ≥5 板**刻意不给满分**（2026-09-18 修正）：修前返回 100，使高位票在
+    「强度持续性」维度拿满分 —— 而 5 板以上在交易纪律里是 C 类「只看不做」
+    （盈亏比已差，爆量开板即预示退潮）。满分会被前端的 S 级评级、以及
+    auction_judge 的六维准入门槛（≥45 才采信竞价信号）一并放大成误导。
+    现值 62 落在 2 板(46) 与 3 板(70) 之间略低：承认其「高」，但对
+    「还能不能继续」的持续性打折价。
+    影响面：本函数被 intensity_six 与 win_score 共用，故 ≥5 板票的 win_score
+    同步降约 4.6 分（board 权重 0.12 × 38）。C 类在 win_pick 中本就返回
+    ok=False、不进 TOP3 展示位，故不改变选股结果，仅修正分数本身的误导。
+    """
     b = int(b or 1)
-    return {1: 20, 2: 46, 3: 70, 4: 88}.get(b, 100 if b >= 5 else 20)
+    return {1: 20, 2: 46, 3: 70, 4: 88}.get(b, 62 if b >= 5 else 20)
 
 
 def _d_seal(s):
@@ -105,6 +182,7 @@ def _d_amt(a):
 
 def intensity_six(r):
     """输入 r: dict(含 board, seal, is_main, zbc, ltsz, amount)。返回(六维dict, 总分, 评级)。"""
+    ensure_strategy()                       # 热重载: 策略文件变更无需重启
     dims = {
         "board": _d_board(r.get("board")),
         "seal":  _d_seal(r.get("seal")),
@@ -116,6 +194,72 @@ def intensity_six(r):
     total = round(sum(dims[k] * W[k] for k in W), 1)
     grade = "S" if total >= 75 else ("A" if total >= 60 else ("B" if total >= 45 else "C"))
     return dims, total, grade
+
+
+# ============ 竞价量比否决门控 (2026-09-22 实证) ============
+# 生产服务器 5 个真实定盘快照 / 12 条正常推送批次实测（买入价 = 当日开盘价 = 9:25 撮合价）：
+#   vol_ratio    n   当日收盘均值   胜率
+#   < 2.5        4      +0.22%      50%
+#   2.5 ~ 3.5    5      +1.39%      60%   <= 甜蜜点
+#   >= 3.5       3      -2.28%      33%   <= 唯一坏档
+#     被挡三只明细：太阳电缆 5.61 → -4.25% / 英联股份 8.57 → -3.39% / 电科思仪 4.30 → +0.80%
+# 机制：「低开 + 显著放量」不是洗盘，是真出货 —— 与「低开是黄金买点」的假设直接冲突。
+#   缺口门控 buy_zone 单独看会把这批票判成 gold 档，必须由量能端否决。
+# 该三只的 vol_verdict 本就是「放量下跌·出」，但历史上只把它当展示文案、不参与门控。
+# 现升级为**硬否决**（在排序中降位，而非全池剔除 —— 保「不空仓」）。
+# 效果（同批样本，被挡后不补位的保守口径，即本表效果为下界）：
+#   当日收盘 +0.08% -> +0.87%(n=9) / 次日开盘 +0.68% -> +1.69%(n=6) / 次日收盘 +1.99% -> +3.00%(n=6)
+#   同期上证 +0.23% / +0.74% / +1.07% —— 调整后三口径全面跑赢基准。
+# ⚠️ 必须记住的局限：n 极小，且**改善几乎全部来自 09-17 这一天**（挡掉那两只 -4.25%/-3.39%）；
+#   只看 09-18/09-21/09-22 三天，本规则是 **-0.09pp 的轻微负贡献**。
+#   故它的定位是「让执行与自身判词一致」的修复 + 有方向的经验规则，**不是已证实的 alpha**；
+#   要升级为「全池剔除」须先由 astock-screen/shadow/ 的前向记录确认。
+VOL_VETO_RATIO = 3.5
+# 量比口径合理性上界（%）。竞价时段「集合竞价成交额 / 前一交易日全天成交额」实测落在
+# 1%~9%（12 条样本），即使最热的小盘票也极少超过 20%。>30 视为**口径异常而非真放量**：
+# 典型来源是盘中补定的名单 —— 其 yamt 与当日累计 amt 同基准，算出 amt/yamt≈1 →
+# vol_ratio≈100（实测 09-16 批次为 99.9999999999 / 100.0025 / 100.00075）。
+# 此类占位值若参与否决，会把整批票误标「放量下跌」，故设上界拦截。
+VOL_VETO_MAX = 30.0
+
+
+def vol_veto(gap, vol_ratio):
+    """竞价「放量下跌」硬否决。返回 (vetoed, reason)。
+
+    生效条件（全部满足才否决）：
+      ① gap 与 vol_ratio 均为有效数 —— 缺失时**一律不否决**（缺失≠放量，宁放行不误杀）；
+      ② VOL_VETO_RATIO <= vol_ratio <= VOL_VETO_MAX —— 上界挡口径异常的占位值；
+      ③ gap < 0 —— 高开放量属「放量确认」，不否决。
+    调用方（rt/bidwatch.py）只做**降位**，不做剔除，以保证「不空仓」。
+    """
+    if gap is None or vol_ratio is None:
+        return False, ""
+    try:
+        vr = float(vol_ratio)
+        gp = float(gap)
+    except Exception:
+        return False, ""
+    if vr > VOL_VETO_MAX:
+        return False, ""            # 口径异常（占位值），不裁决
+    if vr >= VOL_VETO_RATIO and gp < 0:
+        return True, ("竞价量比 %.2f ≥ %.1f 且低开 %+.2f%% —— 放量下跌·真出货"
+                      "（实测该档 -2.28%%、胜率 33%%），本日降位" % (vr, VOL_VETO_RATIO, gp))
+    return False, ""
+
+
+# ============ 卖点纪律 (2026-09-22 补 —— 策略此前只定义买点、从未定义卖点) ============
+# 同一批样本、同一可分子集(n=6，已剔 vr>=3.5)三口径实测：
+#   9:25 买 -> 当日收盘卖   +1.47%
+#   9:25 买 -> 次日开盘卖   +1.69%
+#   9:25 买 -> 次日收盘卖   +3.00%   <= 最优
+# 同期上证同口径 +0.23% / +0.74% / +1.07%。
+# 结论：**隔夜那段才有正期望，且是超额收益的主要来源**；当日平仓≈白干。
+# ⚠️ 局限：样本 3 个交易日、n=6；且「次日收盘卖」承担隔夜跳空风险，勿误读为无风险最优。
+#   n=9 口径下当日 +0.87% / 次日收 +3.00%，方向一致但样本更薄。
+EXIT_RULE = "T+1"
+EXIT_NOTE = "T+1收盘前卖"          # 推送 thing 字段用，≤15 字符
+EXIT_DESC = ("次日(隔夜)收盘前卖出：实测三口径 当日 +1.47% / 次日开 +1.69% / "
+             "次日收 +3.00%（同 n=6）；隔夜段是超额收益主要来源，当日平仓≈零期望")
 
 
 # ============ 量能公理 ============
@@ -132,7 +276,10 @@ def volume_axiom(gap, vol_ratio):
         return ("放量确认·可出手", "#f23645", True)
     if gap >= 2 and vol_ratio < 1:
         return ("缩量诱多·观望", "#2bbf6a", False)
-    if gap < 0 and vol_ratio >= 2:
+    # 2026-09-22：阈值由 2 提到 VOL_VETO_RATIO(3.5) —— 与 vol_veto 共用同一常量，
+    # 避免「展示说放量下跌、门控却不拦」的两套口径。实测 2.5~3.5 反为最优档(+1.39%)，
+    # 原阈值 2 会把这个甜蜜点误标成「放量下跌·出」。
+    if gap < 0 and vol_ratio >= VOL_VETO_RATIO:
         return ("放量下跌·出", "#2bbf6a", False)
     return ("量能中性·看方向", "#f59e0b", None)
 
@@ -143,6 +290,16 @@ def auction_judge(cls, board, gap, phase, stage_code, reco_score, is_main,
     """上游(智能推荐: 情绪周期+六维) → 下游(竞价高开+量能) 的联合裁决。
 
     返回 (signal, action, color, buy)。
+
+    门控顺序（逐级淘汰，任一不通过即不买）：
+      阶段(k<=0 空仓) → C类只看不做 → 启动期非主线放弃 →
+      高潮期非(≥3板∨主线)放弃 → 六维<45放弃 → gap 达阈 且 量能不否决。
+
+    ⚠️ stage_code 由 gen_tomorrow.py 写入名单。2026-09-18 之前该字段**不可能**
+      为 "tuichao"（退潮只能靠 override 传入，而生产链路无人传），故下方的
+      「空仓」门控对退潮阶段完全失效。现已由 resolve_stage 的炸板率推导补齐；
+      若观察到的名单里 stage_code 仍无 tuichao，先确认名单是否为旧版本生成
+      （需重跑 gen_tomorrow.py 才会带上 zb_tc 推导）。
     """
     if phase in ("pre", "pre_open"):
         return ("待竞价", "名单已就绪；明早 9:15 集合竞价开始后，按实时高开+量能给提示",
@@ -151,12 +308,14 @@ def auction_judge(cls, board, gap, phase, stage_code, reco_score, is_main,
         return ("锚·只看不做", "高位核心锚(≥5板)，盈亏比已差，仅作情绪高度参照；爆量开板=板块退潮信号",
                 "#7f8c8d", False)
 
-    # 情绪周期门控：冰点/退潮 直接空仓
+    # 情绪周期门控：k<=0（冰点/退潮）直接空仓
     if override_stage in STAGES:
         code, (sname, sdesc, scolor, k) = override_stage, STAGES[override_stage]
     else:
         code, (sname, sdesc, scolor, k) = resolve_stage(None, stage_code)
-    if code in ("bingdian", "tuichao"):
+    if k <= 0:
+        # 用 k 判定而非硬编码阶段名 —— k 是「该阶段竞价买入的整体可信度」，
+        # 0 即不可参与。这样新增零k阶段自动获得空仓门控，无需两处同步改。
         return ("情绪%s·空仓" % sname, "%s：%s" % (sname, sdesc), "#2bbf6a", False)
 
     if gap is None:
@@ -264,6 +423,16 @@ def yz_risk(r):
 #      故选股(win_score)与买点(buy_zone)是两个正交问题, 不得混用。
 #   2) 唯一可买窗口 = gap ∈ [-4%, -1%)。微低开(-1~0)看似安全实为陷阱(胜率27%)。
 #   3) 旧 win_pick 对 0~+5% 加 8 分、对 -4~-2% 扣 5 分 —— 与本实证相反, 已同步修正。
+#
+# ⚠️ 可信度修正（2026-09-22，**改阈值前必读**）：
+#   上表 gold 档「+2.50%、开买胜率 62%（n=39）」已被两轮独立样本削弱：
+#     ① 服务器完整快照 12 条同档实测 **+0.08%、胜率 50%**（缩水约 1/30）；
+#     ② 子档结论两轮**方向相反** —— 上轮 -1~-2% 最差；本轮 -2~-1.5% 最差(-1.79%)、
+#        -1.5~-1% 最好(+0.78%)，n 仅 3~5。
+#   → 结论：**本表不足以支撑改动 gap 阈值**，gold 档的「唯一正期望」表述应降级为
+#     「历史样本强、近期样本不成立，待前向确认」。当前处理：阈值**刻意不动**，
+#     只把「不空仓 + 量比否决（VOL_VETO_RATIO）」作为本次唯一的策略调整。
+#     禁止再据单轮样本调档（已连续两轮被推翻）。
 BUY_ZONES = [
     (9.8,  1e9,  "yz",   "顶一字·买不进",  "#94a3b8", False, "实测82%晋级但仅9%开买胜率,基本买不进"),
     (5.0,  9.8,  "high", "高开过甚·放弃",  "#2bbf6a", False, "该档56只开买-1.77%,当日涨幅(+5.21%)全被缺口吃掉"),
@@ -285,6 +454,7 @@ def buy_zone(gap):
     与 win_score 的「选哪只」职责正交: win_score 决定盯哪几只, buy_zone 决定买不买。
     返回 dict(code/label/color/buy/gap/note); gap 为 None 时 buy=None(待竞价确认)。
     """
+    ensure_strategy()                       # 热重载: 策略文件变更无需重启
     if gap is None:
         return {"code": None, "label": "待竞价确认", "color": "#94a3b8",
                 "buy": None, "gap": None, "note": "尚无竞价缺口数据, 无法判定买点"}
@@ -345,8 +515,14 @@ def win_pick(r, gap=None, stage_code=None, mood=None):
     if r.get("cls") == "C":
         return (adj, "高位锚·只看不做", "#7f8c8d", False,
                 "；".join(reasons) or "高位核心锚，盈亏比差")
-    if stage_code in ("bingdian", "tuichao") or decline:
-        tag = {"tuichao": "退潮期", "bingdian": "冰点"}.get(stage_code, "亏钱效应扩散")
+    # 情绪门控走 k（单一事实源），不再硬编码阶段名 —— 与 auction_judge 同口径。
+    # 未知阶段（None）不误判为空仓，仍由 mood 的「亏钱效应」兜底。
+    _k = stage_k(stage_code)
+    if (_k is not None and _k <= 0) or decline:
+        tag = {"tuichao": "退潮期", "bingdian": "冰点"}.get(stage_code)
+        if not tag:
+            _st = STAGES.get(stage_code)
+            tag = ("%s期" % _st[0]) if _st else "亏钱效应扩散"
         return (adj - 20, "%s·只低吸轻仓" % tag, "#2bbf6a", False,
                 "%s：降仓或空仓，仅做形态最优的低吸" % tag + ("；" + "；".join(reasons) if reasons else ""))
     if gap is not None and gap >= 5:
@@ -359,3 +535,179 @@ def win_pick(r, gap=None, stage_code=None, mood=None):
         return (adj, bz["label"], bz["color"], True, "；".join(reasons))
     return (adj, "次日首选·等竞价确认", "#f23645", True,
             "；".join(reasons) or "六维与形态均达标")
+STRATEGY_PARAM_KEYS = ["STAGES", "W", "WIN_W", "BUY_ZONES", "_BUY_ADJ",
+                       "VOL_VETO_RATIO", "VOL_VETO_MAX", "EXIT_RULE", "EXIT_NOTE"]
+STRATEGY_NOTES = {
+    "STAGES":    "情绪周期五阶段",
+    "W":         "强度持续性六维权重(reco_score)",
+    "WIN_W":     "赚钱效应分实证权重(win_score)",
+    "BUY_ZONES": "竞价缺口分档门控(buy_zone, 2026-09-14 复盘实证)",
+    "_BUY_ADJ":  "形态加减分(排序用)",
+    # 2026-09-22 新增（竞价推送策略调整）：
+    "VOL_VETO_RATIO": "竞价量比否决阈值(低开+量比≥此值=放量下跌·真出货；实测 ≥3.5 档 -2.28%/胜率33%)",
+    "VOL_VETO_MAX":   "量比口径合理性上界(超过视为占位值/口径异常, 不否决；仅调阈值不用改此值)",
+    "EXIT_RULE":      "卖点纪律标识(T+1=持到次日；供推送/复盘引用)",
+    "EXIT_NOTE":      "卖点提示文案(推送 thing 字段，须 ≤15 字符，超长会被 clip 截断)",
+}
+
+
+def _strategy_root():
+    return _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "strategy")
+
+
+def _yyyymm_of(path):
+    m = _re.search(r"strategy_(\d{6})\.json$", _os.path.basename(path))
+    return int(m.group(1)) if m else 0
+
+
+def _git_head():
+    try:
+        return _sp.check_output(["git", "rev-parse", "HEAD"],
+                                cwd=_os.path.dirname(_os.path.abspath(__file__)),
+                                stderr=_sp.DEVNULL).decode().strip() or None
+    except Exception:
+        return None
+
+
+def load_strategy(yyyymm=None):
+    """载入并应用当期策略: 把文件 params 覆盖到模块级常量。"""
+    if yyyymm:
+        yyyymm = str(yyyymm)
+        pp = _os.path.join(_strategy_root(), yyyymm[:4], "strategy_%s.json" % yyyymm)
+        if not _os.path.exists(pp):
+            raise FileNotFoundError(pp)
+    else:
+        files = _glob.glob(_os.path.join(_strategy_root(), "*", "strategy_*.json"))
+        pp = max(files, key=_yyyymm_of) if files else None
+    if not pp or not _os.path.exists(pp):
+        return (None, None)
+    d = _json.load(open(pp, encoding="utf-8"))
+    for k in STRATEGY_PARAM_KEYS:
+        if k in d.get("params", {}):
+            globals()[k] = d["params"][k]
+    return (yyyymm or ("%06d" % _yyyymm_of(pp)), pp)
+
+
+_strategy_cache = {"sig": (None, None)}
+
+
+def _latest_strategy_path():
+    files = _glob.glob(_os.path.join(_strategy_root(), "*", "strategy_*.json"))
+    return max(files, key=_yyyymm_of) if files else None
+
+
+def ensure_strategy():
+    """评分前调用: 当期策略文件较已加载更新(或首次)则热重载, 无需重启进程。"""
+    pp = _latest_strategy_path()
+    if not pp:
+        return
+    try:
+        m = _os.path.getmtime(pp)
+    except OSError:
+        return
+    if _strategy_cache["sig"] != (pp, m):
+        try:
+            d = _json.load(open(pp, encoding="utf-8"))
+            for k in STRATEGY_PARAM_KEYS:
+                if k in d.get("params", {}):
+                    globals()[k] = d["params"][k]
+            _strategy_cache["sig"] = (pp, m)
+        except Exception as _e:
+            import sys as _sys
+            _sys.stderr.write("[warn] 策略热重载失败, 沿用旧策略: %s\n" % _e)
+
+
+def _norm_params(p):
+    """params 归一化(稳定序列化), 用于判断「内容是否真的变了」——
+    忽略 dict 键顺序、tuple 与 list 的差异, 只比较实质取值。"""
+    try:
+        return _json.dumps(p, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return None
+
+
+def new_strategy(yyyymm=None, force=False):
+    """基于当期生效策略(或内置默认)生成一个新的月度策略文件。
+
+    加固(2026-09-19):
+      · 幂等 —— 目标文件已存在且 params 完全一致时不重写, 也不刷新 generated_at。
+                避免每次执行都产生「只有时间戳变」的无意义 diff, 降低多机 pull 的冲突面。
+      · 防误覆盖 —— 目标文件已存在且 params 有差异时默认拒绝写入(需 --force),
+                    防止手滑用当期值冲掉当月已调好的权重。
+
+    返回 (path, status):
+      created   新文件已创建
+      unchanged 已存在且参数一致 -> 未重写(幂等)
+      updated   已存在且参数有差异 + 已 --force -> 已覆盖写入
+      blocked   已存在且参数有差异但未 --force -> 拒绝覆盖
+    """
+    if yyyymm is None:
+        yyyymm = _dt.datetime.now().strftime("%Y%m")
+    yyyymm = str(yyyymm)
+    out_dir = _os.path.join(_strategy_root(), yyyymm[:4])
+    _os.makedirs(out_dir, exist_ok=True)
+    pp = _os.path.join(out_dir, "strategy_%s.json" % yyyymm)
+    existed = _os.path.exists(pp)
+    params = {k: globals().get(k) for k in STRATEGY_PARAM_KEYS}
+
+    if existed:
+        try:
+            old = _json.load(open(pp, encoding="utf-8"))
+        except Exception:
+            old = {}
+        if _norm_params(old.get("params")) == _norm_params(params):
+            return (pp, "unchanged")
+        if not force:
+            return (pp, "blocked")
+    snap = {
+        "generated_at": _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "engine_file": _os.path.basename(__file__),
+        "git_head": _git_head(),
+        "yyyymm": yyyymm,
+        "params": params,
+        "notes": STRATEGY_NOTES,
+    }
+    with open(pp, "w", encoding="utf-8") as f:
+        _json.dump(snap, f, ensure_ascii=False, indent=2)
+    return (pp, "updated" if existed else "created")
+
+
+try:
+    ACTIVE_STRATEGY = load_strategy()
+except Exception as _e:
+    import sys as _sys
+    _sys.stderr.write("[warn] 加载策略文件失败, 回落内置默认值: %s\n" % _e)
+    ACTIVE_STRATEGY = (None, None)
+
+_ap = _latest_strategy_path()
+try:
+    _strategy_cache["sig"] = (_ap, _os.path.getmtime(_ap)) if _ap else (None, None)
+except OSError:
+    _strategy_cache["sig"] = (None, None)
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="策略外置: 生成/查看 strategy/<YYYY>/ 下的月度策略文件")
+    ap.add_argument("--new", nargs="?", const="", help="生成新策略文件(可选 YYYYMM, 默认当月)")
+    ap.add_argument("--force", action="store_true",
+                    help="配合 --new: 目标月份已存在且参数有差异时强制覆盖(默认拒绝)")
+    ap.add_argument("--yyyymm", help="指定查看的月份(YYYYMM)")
+    ap.add_argument("--show", action="store_true", help="打印当期生效策略")
+    a = ap.parse_args()
+    if a.new is not None:
+        pp, st = new_strategy(a.new or None, force=a.force)
+        if st == "unchanged":
+            print("未重写(幂等): 该文件已存在且参数完全一致 ->", pp)
+        elif st == "blocked":
+            print("已拒绝覆盖(防误冲当月权重): 该文件已存在且参数有差异 ->", pp)
+            print("  ① 确需重建 -> 加 --force;  ② 想回到代码内置默认值 -> 先移走该文件再 --new")
+        else:
+            print("已%s策略文件:" % ("更新" if st == "updated" else "生成"), pp,
+                  "\n  -> 编辑其中 params 调整权重, 保存后评分函数会自动热加载, 无需重启服务")
+    else:
+        ym, pp = load_strategy(a.yyyymm)
+        print("当期策略月份:", ym, "| 文件:", pp)
+        if ym:
+            print(_json.dumps({k: globals().get(k) for k in STRATEGY_PARAM_KEYS},
+                              ensure_ascii=False, indent=2))

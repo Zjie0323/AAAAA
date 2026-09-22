@@ -406,6 +406,24 @@ def main() -> int:
     log("  口径=%s  定格时刻=%s  情绪=%s  标的=%d 只"
         % (j.get("mode_name") or "-", j.get("frozen_at") or "-",
            j.get("mood") or "-", len(picks)))
+
+    # ---- 护栏 5：定盘口径（深度防御，2026-09-22 加）------------------------
+    # 09-16 事故：09:25 定盘失败 → 14:07 盘中补定(mode=intraday) → 22:13 被推送，
+    # 补定快照的 gap 基准不是 9:25 撮合价，三只 -7.12%/-3.39%/-6.96%（全样本最差）。
+    # 本机该次未受影响（本机 09:16 推送时刻正常 09:25:47、openid=all），
+    # 但本脚本的 --deadline 可被覆盖，故与服务器 rt/push.py 保持同一道校验。
+    if not args.dry_run:
+        _sd, _sm = j.get("date"), j.get("mode")
+        if _sd and _sd != today.strftime("%Y%m%d"):
+            log("快照日期 %s ≠ 今日 %s -> 拒绝推送过期名单"
+                % (_sd, today.strftime("%Y%m%d")), "ERROR")
+            return EXIT_TIMEOUT
+        if _sm and _sm not in ("auction", "auction_late"):
+            log("快照定盘口径为「%s」（%s @%s）-> 非 9:25 定盘，gap 基准不可信，拒推"
+                % (j.get("mode_name") or _sm, j.get("date_label") or "-",
+                   j.get("frozen_at") or "-"), "ERROR")
+            return EXIT_TIMEOUT
+        log("定盘口径校验通过：mode=%s frozen_at=%s" % (_sm, j.get("frozen_at")))
     for i, p in enumerate(picks[:3], 1):
         log("  [%d] %s %s  gap=%s" % (i, p.get("name"), p.get("code"),
                                       p.get("gap_used", p.get("gap"))))
