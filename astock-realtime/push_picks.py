@@ -472,10 +472,11 @@ def _slot_text(p: dict, meta: dict | None = None) -> str:
 
 
 def _buy_gate_text(meta: dict) -> str:
-    """提示位文案 = 当前生效的**买点门槛**（老张最关注这个字段）。
+    """买点门槛文案 —— 供 `_tip_value`（`build_single` 的 tip 位）使用。
 
     为什么不能硬编码：2026-09-23 之前 `build_single` 里写死「只买低开-4~-1%，其余观望」，
     改成高开模式后文案不跟随，会推着高开票却让用户「只买低开」——文案与内容自相矛盾。
+    （这正是 09-23 那张推送截图里那句话的来源。）
     现按 meta.gap_mode（由 reco_engine.GAP_MODE → base_meta → freeze 落盘下发）动态生成，
     与 `_BUY_MARK_HIGH` 严格同源。
     """
@@ -490,7 +491,16 @@ def _buy_gate_text(meta: dict) -> str:
 
 
 def _tip_value(meta: dict, picks: list) -> str:
-    """提示位最终取值：命令行 --tip 覆盖 > 买点门槛。"""
+    """提示位取值 = **买点门槛**（仅 `build_single` 用）。
+
+    ⚠️ 与 `_tip_text` 的分工，勿混用：
+      · `_tip_text`  = [情绪标签·]卖点纪律 —— `build_slots` / `build_compact` 用（2026-09-22 起）；
+      · `_tip_value` = 当前生效的买点门槛   —— **仅** `build_single` 用
+        （该模板的 tip 位历来放门槛，原为硬编码，本轮改为跟随 `gap_mode` 动态生成）。
+
+    分工理由：`slots` 是生产默认模式，其提示位自 09-22 起承载卖点纪律；
+    买点门槛在 slots 里由每只票的「买/观/弃」标记逐票表达，无需再占公共字段。
+    """
     return clip(str(meta.get("tip_override") or _buy_gate_text(meta)))
 
 
@@ -532,9 +542,12 @@ def build_slots(picks: list, meta: dict, fields: dict) -> list[dict]:
     if fields.get("time"):
         data[fields["time"]] = {"value": _t(meta)}
     if fields.get("tip"):
-        # 2026-09-23：由固定卖点文案改为**当前买点门槛**（高开模式下自动变
-        # 「只买高开0~5%·4板内」），与 _slot_mark 的买/观/弃标记同源，不会再互相打架。
-        data[fields["tip"]] = {"value": _tip_value(meta, picks)}
+        # 保持 2026-09-22 确立的语义：提示位 = **[情绪标签·]卖点纪律**。
+        # ⚠️ 2026-09-23 曾一度改成 _tip_value（买点门槛），**已回退** —— 那会无声推翻上轮
+        #    基于 n=6 实证的决定（当日 +1.47% / 次日开 +1.69% / 次日收 +3.00% → 隔夜段才是
+        #    超额收益来源，卖点纪律更该占这个字段）。买点门槛改由每只票的「买/观/弃」
+        #    标记（_slot_mark）逐票表达，不占公共字段。分工详见 _tip_text / _tip_value。
+        data[fields["tip"]] = {"value": _tip_text(meta, picks, meta.get("tip_override"))}
     return [{"stock": "3只分列", "data": data}]
 
 
