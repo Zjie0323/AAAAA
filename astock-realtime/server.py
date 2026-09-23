@@ -52,6 +52,21 @@ except Exception:
     VOL_VETO_RATIO = 3.5
     EXIT_RULE, EXIT_NOTE, EXIT_DESC = "T+1", "T+1收盘前卖", ""
 
+
+def _re_attr(name, default):
+    """动态读 reco_engine 的模块级常量。
+
+    为什么不能直接用 `from reco_engine import VOL_VETO_RATIO` 的值：reco_engine 支持
+    **策略文件热重载**（`ensure_strategy()` 会覆写模块全局），而 `from ... import` 只拿到
+    导入那一刻的快照。`vol_veto()` 自身在调用时读模块全局（永远最新），但**展示用**的
+    阈值若用导入快照，就会出现「门控按 4.0 判、界面写 3.5」的口径漂移。
+
+    2026-09-23：MAX_BOARD / PREFER_FIRST_BOARD / GAP_MODE 同样走这里 ——
+    改 strategy/*.json 即热生效，无需重启本服务。
+    """
+    m = sys.modules.get("reco_engine")
+    return getattr(m, name, default) if m is not None else default
+
 # 盘口/个股异动实时采集模块(与 quote.eastmoney.com/changes 同源)
 #   职责: 交易时段后台按节拍采集异动明细流 -> 环形缓冲(seq 游标) -> /api/changes 增量输出
 #   联动判定「创业板异动 + 同行业主板涨停」复用本服务已有的涨停池缓存(见 _zt_provider)
@@ -1436,6 +1451,18 @@ def maybe_freeze_picks(picks, meta):
                 "base": meta.get("base"), "phase": meta.get("phase"),
                 "mood": meta.get("mood"), "mood_desc": meta.get("mood_desc"),
                 "stage_name": meta.get("stage_name"),
+                # 卖点纪律随快照落盘 —— 让快照自描述，push_picks 不必硬编码文案。
+                # （2026-09-22 同步遗漏，2026-09-23 补齐 —— 缺这些字段时 push_picks 从
+                #   快照读到的 exit_note / vol_veto_ratio 恒为 None。）
+                "exit_rule": meta.get("exit_rule"), "exit_note": meta.get("exit_note"),
+                "exit_desc": meta.get("exit_desc"),
+                "pick_rule": meta.get("pick_rule"),
+                "vol_veto_ratio": meta.get("vol_veto_ratio"),
+                # 2026-09-23 买点模式随快照落盘 —— push_picks 据此决定「买/观/弃」标记与提示文案，
+                # 避免像「只买低开-4~-1%」那样写死在 build_single/build_slots 里（改策略后文案不跟随）。
+                "gap_mode": meta.get("gap_mode"),
+                "max_board": meta.get("max_board"),
+                "prefer_first_board": meta.get("prefer_first_board"),
                 "picks": picks}
         try:
             _save_frozen_picks(snap)
@@ -1464,7 +1491,7 @@ def start_freeze_scheduler():
 
 
 def _pick_key(r):
-    """TOP3 精选排序键 —— 2026-09-22 改为「不空仓 + 赚钱效应优先」三级降位。
+    """TOP3 精选排序键 —— 2026-09-22 改为「**不空仓** + 赚钱效应优先」三级降位。
 
     档位（数字越小越优先）：
       0  可参与(win_ok) 且无「放量下跌」  -> 正常推
@@ -1473,10 +1500,33 @@ def _pick_key(r):
     旧键 `(not win_ok, -win_adj, …)` 让 win_ok 单独决定展示位，与下游 push_picks 的
     buy 标记叠加后，用户收到的是策略自己判「不可买」的票（服务器 5 快照 15/15 条
     buy=False 却全被推送）。改为分级降位后：任何单一门控都无法清空推送（不空仓），
-    赚钱效应分 win_adj 成为实际主排序键。与仓库 rt/bidwatch.py 保持同一口径。
+    赚钱效应分 win_adj 成为实际主排序键。
+
+    2026-09-23 追加两档（老张口径：优先首板、4 板以上不考虑）：
+      第 3 位 `_over`  = 1 -> board > MAX_BOARD(3)，即 4 板及以上垫底
+                        （「不考虑」但**不剔除**，保住「不空仓」原则：
+                          极端情况下凑不出别的票时仍会推）
+      第 4 位 `_first` = 0 -> board == 1（首板）优先，「优先选择首板涨停后的」
+    两者都取自 reco_engine 模块全局（_re_attr 动态读），改 strategy/*.json 即热生效。
+
+    ⚠️ 本文件是**扁平运行副本**（仓库 B），与仓库 A 的 `rt/bidwatch.py::_pick_key`
+    必须保持同一口径 —— 改一处务必同步另一处。回切高开见 `GAP_MODE`。
     """
+    _mb = _re_attr("MAX_BOARD", 3)
+    _pf = _re_attr("PREFER_FIRST_BOARD", True)
+    try:
+        _lb = int(r.get("board") or 0)
+    except Exception:
+        _lb = 0
+    try:
+        _over = 1 if _lb > int(_mb) else 0
+    except Exception:
+        _over = 0
+    _first = 0 if (_pf and _lb == 1) else 1
     return (1 if r.get("veto") else 0,
             1 if not r.get("win_ok") else 0,
+            _over,
+            _first,
             -(r.get("win_adj") or 0),
             -(r.get("reco_score") or 0),
             -(r.get("seal") or 0))
@@ -1504,9 +1554,21 @@ def build_bid_watch_payload():
                  "stage_desc": watch.get("stage_desc"),
                  "stage_color": watch.get("stage_color"),
                  # 2026-09-22 调整：推送策略（不空仓 + 赚钱效应排序 + 量比否决）+ 卖点纪律
-                 "pick_rule": "不空仓·按赚钱效应(win_adj)取 TOP3；仅对「放量下跌」降位，不做剔除",
-                 "vol_veto_ratio": VOL_VETO_RATIO,
-                 "exit_rule": EXIT_RULE, "exit_note": EXIT_NOTE, "exit_desc": EXIT_DESC}
+                 # 2026-09-23 追加：买点模式/高位板上限/首板优先（老张口径，均走 _re_attr 动态读）
+                 "pick_rule": ("不空仓·按赚钱效应(win_adj)取 TOP3；买点模式=%s；"
+                               "%s 板以上不考虑；首板优先=%s；"
+                               "仅对「放量下跌」降位，不做剔除"
+                               % (_re_attr("GAP_MODE", "low"),
+                                  _re_attr("MAX_BOARD", 3),
+                                  "是" if _re_attr("PREFER_FIRST_BOARD", False) else "否")),
+                 "gap_mode": _re_attr("GAP_MODE", "low"),
+                 "max_board": _re_attr("MAX_BOARD", 3),
+                 "prefer_first_board": _re_attr("PREFER_FIRST_BOARD", False),
+                 # 阈值/文案动态读 —— 策略文件热重载后不会显示过期值（见 _re_attr）
+                 "vol_veto_ratio": _re_attr("VOL_VETO_RATIO", VOL_VETO_RATIO),
+                 "exit_rule": _re_attr("EXIT_RULE", EXIT_RULE),
+                 "exit_note": _re_attr("EXIT_NOTE", EXIT_NOTE),
+                 "exit_desc": _re_attr("EXIT_DESC", EXIT_DESC)}
     if not items:
         return 200, dict(base_meta, data={"count": 0, "buy": 0, "items": []})
     # 情绪周期阶段 code(供竞价裁决门控)

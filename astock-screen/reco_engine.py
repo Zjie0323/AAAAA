@@ -307,6 +307,13 @@ def auction_judge(cls, board, gap, phase, stage_code, reco_score, is_main,
     if cls == "C":
         return ("锚·只看不做", "高位核心锚(≥5板)，盈亏比已差，仅作情绪高度参照；爆量开板=板块退潮信号",
                 "#7f8c8d", False)
+    # 高位板剔除（2026-09-23 老张：「4 板以上不考虑」）—— 放在 cls=="C" 之后，
+    # 保证 4 板走本门控、≥5 板仍走上面的「锚」语义，两处不重复。
+    if not board_allowed(board):
+        return ("高位板·放弃",
+                "%d 板已超 %d 板上限（高位盈亏比差，老张口径：4 板以上不考虑），不参与"
+                % (int(board or 0), int(globals().get("MAX_BOARD", MAX_BOARD))),
+                "#7f8c8d", False)
 
     # 情绪周期门控：k<=0（冰点/退潮）直接空仓
     if override_stage in STAGES:
@@ -348,6 +355,15 @@ def auction_judge(cls, board, gap, phase, stage_code, reco_score, is_main,
         return ("弱转强·待量能确认",
                 "高开%+.1f%%达标，%s，量能确认即出手" % (gap, vv),
                 "#f59e0b", False)
+    # 2026-09-23 老张要求「高开」：把 0 ~ thr 这一段也判可买，否则会与 buy_zone
+    # （高开模式的 HIGH_BUY_ZONES = flat+mid）互相矛盾 —— 那正是此前「门控互斥 93%」的老问题。
+    if gap >= 0 and globals().get("GAP_MODE", "low") == "high":
+        if vconfirm is False:
+            return ("高开缩量·诱多观望",
+                    "高开%+.1f%%但缩量（量能公理：缩量不追），等放量再决" % gap,
+                    "#2bbf6a", False)
+        return ("高开·可买", "高开%+.1f%%，%s；冲高不板即兑现" % (gap, vv),
+                "#f23645", True)
     if gap >= -1:
         return ("观察", "高开%+.1f%%平开附近，等量能方向确认" % gap, "#f59e0b", False)
     return ("弱/退潮", "低开%+.1f%%，强转弱竞价清；破昨收无条件走" % gap, "#2bbf6a", False)
@@ -447,6 +463,66 @@ BUY_ZONES = [
 _BUY_ADJ = {"gold": 20, "deep": -8, "mic": -10, "flat": -5,
             "mid": -12, "high": -25, "yz": -40}
 
+# ============ 买点模式（2026-09-23 老张要求：高开博弈涨停）============
+# 切换：改 strategy/<YYYY>/strategy_<YYYYMM>.json 的 GAP_MODE（保存即热重载，无需重启）。
+#   "low"  = 低开黄金档 gap ∈ [-4,-1)   ← 2026-09-23 之前的长期口径
+#   "high" = 高开博弈  gap ∈ [0,+5)     ← 老张 2026-09-23 明确要求
+#
+# ⚠️⚠️ 数据反对本次切换，此处如实留档（详见 _astock_gap_eval_20260923.md）：
+#   14 个买入日 / n=1114 实测：低开档 14 日累积 **+18.87%**（10/14 天赚）、盈亏比 1.56；
+#                              高开档 14 日累积 **-13.05%**（仅 3/14 天赚）、盈亏比 0.94。
+#   逐日配对：低开占优 **11/14 天**。高开≥+5% 档胜率 53%（比低开 49% 还高）但盈亏比仅 0.46 → 期望 -1.37%。
+#   根因：**高开把涨停收益让渡给了前一日持有人** —— 同样赌中涨停，
+#         高开档只赚 +4.17%、不涨停亏 -1.94%；低开档赚 +12.52%、不涨停仅亏 -0.25%。
+#   → 本切换为**老张明确指令**，不是数据结论。回切一行：GAP_MODE 改回 "low"。
+GAP_MODE = "high"
+HIGH_BUY_ZONES = ("flat", "mid")     # 高开模式下 buy=True 的档：0~+1% 与 +1~+5%
+
+# 高位板剔除（老张要求「4 板以上不考虑」）—— board > MAX_BOARD 直接放弃。
+MAX_BOARD = 3
+# 首板优先（老张要求「优先选择首板涨停后的」）—— 排序时 board=1 优先。
+PREFER_FIRST_BOARD = True
+
+# 高开模式的形态加减表：可买档必须给正分，否则排序会把可买档压到低开档之后
+# （win_adj 是推送实际主排序键，见 rt/bidwatch.py::_pick_key）
+_BUY_ADJ_HIGH = {"flat": 15, "mid": 20, "high": -20, "yz": -40,
+                 "mic": -10, "gold": -5, "deep": -15}
+
+# 高开模式下可买档的 note 覆盖 —— 原表说明是为低开口径写的（「无正期望」「最大敞口」），
+# 直接沿用会与「可买」自相矛盾。数字为 2026-09-23 全池可买口径实测。
+HIGH_MODE_NOTE = {
+    "flat": "高开模式可买档(0~+1%)：⚠️ 14日实测 +0.61%/胜率50%(n=118)、盈亏比 1.46",
+    "mid":  "高开模式可买档(+1~+5%)：⚠️ 14日实测 -0.41%/胜率43%(n=330)、盈亏比 1.17",
+}
+
+
+def cur_buy_adj():
+    """按 GAP_MODE 返回生效的形态加减表（每次读模块全局，热重载安全）。"""
+    if globals().get("GAP_MODE", "low") == "high":
+        return globals().get("_BUY_ADJ_HIGH", _BUY_ADJ_HIGH)
+    return globals().get("_BUY_ADJ", _BUY_ADJ)
+
+
+def zone_buy(code, default):
+    """该档是否可买 —— 唯一入口，避免 buy_zone / 展示 / 推送三处口径漂移。"""
+    if globals().get("GAP_MODE", "low") == "high":
+        return code in tuple(globals().get("HIGH_BUY_ZONES", HIGH_BUY_ZONES))
+    return default
+
+
+def board_allowed(board):
+    """高位板过滤：board > MAX_BOARD 即超限（老张口径：4 板以上不考虑）。
+
+    board 缺失/为 0 时返回 True（未知板数不误杀）。
+    """
+    try:
+        b = int(board or 0)
+    except Exception:
+        return True
+    if b <= 0:
+        return True
+    return b <= int(globals().get("MAX_BOARD", MAX_BOARD))
+
 
 def buy_zone(gap):
     """买点门控 —— 由竞价缺口判定「可买 / 观望 / 放弃」。
@@ -460,8 +536,18 @@ def buy_zone(gap):
                 "buy": None, "gap": None, "note": "尚无竞价缺口数据, 无法判定买点"}
     for lo, hi, code, label, color, buy, note in BUY_ZONES:
         if lo <= gap < hi:
+            b = zone_buy(code, buy)
+            if globals().get("GAP_MODE", "low") == "high":
+                # 高开模式：文案跟 buy 标志一致，避免出现「黄金买点」却 buy=False 的自相矛盾
+                if b:
+                    label = label.split("·")[0] + "·可买"
+                    color = "#f23645"
+                    note = globals().get("HIGH_MODE_NOTE", HIGH_MODE_NOTE).get(code, note)
+                elif buy is True:
+                    label = label.split("·")[0] + "·本轮不买"
+                    color = "#7f8c8d"
             return {"code": code, "label": label, "color": color,
-                    "buy": buy, "gap": round(gap, 2), "note": note}
+                    "buy": b, "gap": round(gap, 2), "note": note}
     return {"code": None, "label": "待确认", "color": "#94a3b8",
             "buy": None, "gap": round(gap, 2), "note": ""}
 
@@ -485,7 +571,7 @@ def win_pick(r, gap=None, stage_code=None, mood=None):
         # 形态加减分与 buy_zone 同源(342 只实证), 防止两处口径漂移。
         # 本次修正了旧口径的反向错误: 旧版对 0~+5%(实测开买 -1.18%) 加 8 分、
         # 对 -4~-2%(实测黄金区) 扣 5 分, 会导致看板推荐负期望档、惩罚正期望档。
-        adj += _BUY_ADJ.get(bz["code"], 0)
+        adj += cur_buy_adj().get(bz["code"], 0)   # 按 GAP_MODE 选表（高开模式下可买档给正分）
         reasons.append("%s(%+.1f%%)·%s" % (bz["label"], gap, bz["note"]))
 
     if (r.get("seal") or 0) >= 1:
@@ -512,6 +598,13 @@ def win_pick(r, gap=None, stage_code=None, mood=None):
     if blocked:
         return (adj, "一字风险极高·大概率买不进", "#2bbf6a", False,
                 "；".join(reasons) + "；等竞价看是否给低吸点, 不给就放弃")
+    # 高位板剔除（2026-09-23 老张：「4 板以上不考虑」）。
+    # 注意：这里只让 ok=False，**不剔除** —— 下游 _pick_key 把它降到第 3 档，
+    # 仍遵守「任何单一门控都无法清空推送」的「不空仓」原则。
+    if not board_allowed(r.get("board")):
+        return (adj, "高位板·只看不做", "#7f8c8d", False,
+                "；".join(reasons) + "；%d 板超 %d 板上限（4 板以上不考虑）"
+                % (int(r.get("board") or 0), int(globals().get("MAX_BOARD", MAX_BOARD))))
     if r.get("cls") == "C":
         return (adj, "高位锚·只看不做", "#7f8c8d", False,
                 "；".join(reasons) or "高位核心锚，盈亏比差")
@@ -536,13 +629,23 @@ def win_pick(r, gap=None, stage_code=None, mood=None):
     return (adj, "次日首选·等竞价确认", "#f23645", True,
             "；".join(reasons) or "六维与形态均达标")
 STRATEGY_PARAM_KEYS = ["STAGES", "W", "WIN_W", "BUY_ZONES", "_BUY_ADJ",
+                       "_BUY_ADJ_HIGH", "GAP_MODE", "HIGH_BUY_ZONES",
+                       "MAX_BOARD", "PREFER_FIRST_BOARD",
                        "VOL_VETO_RATIO", "VOL_VETO_MAX", "EXIT_RULE", "EXIT_NOTE"]
 STRATEGY_NOTES = {
     "STAGES":    "情绪周期五阶段",
     "W":         "强度持续性六维权重(reco_score)",
     "WIN_W":     "赚钱效应分实证权重(win_score)",
     "BUY_ZONES": "竞价缺口分档门控(buy_zone, 2026-09-14 复盘实证)",
-    "_BUY_ADJ":  "形态加减分(排序用)",
+    "_BUY_ADJ":  "形态加减分·低开模式(排序用)",
+    # 2026-09-23 新增（老张要求：高开博弈涨停 + 首板优先 + 剔除4板以上）：
+    "GAP_MODE":          '买点模式: "low"=低开黄金档[-4,-1) / "high"=高开博弈[0,+5)。'
+                         '⚠️ 实测高开档 14日累积-13.05% vs 低开+18.87%（逐日低开占优11/14天），'
+                         '本次切换是老张明确指令、非数据结论；回切改回 "low" 即可',
+    "HIGH_BUY_ZONES":    "高开模式下 buy=True 的档位（默认 flat+mid = gap ∈ [0,+5)）",
+    "_BUY_ADJ_HIGH":     "形态加减分·高开模式（可买档必须给正分，否则 win_adj 排序会把高开票压后）",
+    "MAX_BOARD":         "连板上限：board > 此值即放弃（老张口径「4板以上不考虑」→ 3）",
+    "PREFER_FIRST_BOARD": "首板优先（老张口径「优先选择首板涨停后的」）→ 排序时 board=1 优先",
     # 2026-09-22 新增（竞价推送策略调整）：
     "VOL_VETO_RATIO": "竞价量比否决阈值(低开+量比≥此值=放量下跌·真出货；实测 ≥3.5 档 -2.28%/胜率33%)",
     "VOL_VETO_MAX":   "量比口径合理性上界(超过视为占位值/口径异常, 不否决；仅调阈值不用改此值)",

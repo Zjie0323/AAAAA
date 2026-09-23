@@ -246,7 +246,11 @@ def load_picks(target: date | None = None, board: str = LOCAL_BOARD) -> tuple[li
                                     "mode_name": j.get("mode_name"),
                                     "mood": j.get("mood"), "date_label": j.get("date_label"),
                                     "exit_note": j.get("exit_note"),
-                                    "exit_rule": j.get("exit_rule")}
+                                    "exit_rule": j.get("exit_rule"),
+                                    # 2026-09-23 买点模式（决定买/观/弃标记与提示文案）
+                                    "gap_mode": j.get("gap_mode"),
+                                    "max_board": j.get("max_board"),
+                                    "prefer_first_board": j.get("prefer_first_board")}
     st, j = http_json(f"{board}/api/bid_watch", timeout=25)
     if st == 200 and isinstance(j, dict):
         data = j.get("data") or {}
@@ -259,7 +263,10 @@ def load_picks(target: date | None = None, board: str = LOCAL_BOARD) -> tuple[li
                            # 实时接口把 exit_* / pick_rule 放在**顶层**（由 base_meta 合并而来），
                            # 不在 data 里 —— 两个分支取法不同是接口形状决定的，勿统一。
                            "exit_note": data.get("exit_note") or j.get("exit_note"),
-                           "exit_rule": j.get("exit_rule")}
+                           "exit_rule": j.get("exit_rule"),
+                           "gap_mode": data.get("gap_mode") or j.get("gap_mode"),
+                           "max_board": j.get("max_board"),
+                           "prefer_first_board": j.get("prefer_first_board")}
     raise SystemExit(f"取不到 TOP3：{snap.name} 不存在，且 {board}/api/bid_watch 无 picks"
                      f"（HTTP {st}）。请确认看板已启动或换 --date。")
 
@@ -354,7 +361,8 @@ def build_single(picks: list, meta: dict, fields: dict) -> list[dict]:
     data = {
         fields["title"]: {"value": clip("竞价精选3只")},
         fields["body"]: {"value": clip(body)},
-        fields["tip"]: {"value": clip("只买低开-4~-1%，其余观望")},
+        # 2026-09-23：改为动态买点门槛（原文案写死「只买低开-4~-1%」，切高开后不跟随）
+        fields["tip"]: {"value": _tip_value(meta, picks)},
     }
     if fields.get("time"):
         data[fields["time"]] = {"value": clip(f"{hm} 定盘")}
@@ -406,10 +414,32 @@ _BUY_MARK = {
     "high": "弃",   # 高开 5~9.8%
     "yz":   "弃",   # 顶一字 >=9.8%，买不进
 }
+# 高开模式（老张 2026-09-23 口径：高开博弈涨停 + 4板内 + 首板优先）
+# 可买档 = flat + mid，与 reco_engine.HIGH_BUY_ZONES 严格同源（改策略文件两处一起生效）。
+_BUY_MARK_HIGH = {
+    "flat": "买",   # 平开 0~+1%（高开模式可买档）
+    "mid":  "买",   # 小高开 +1~+5%（高开模式可买档）
+    "high": "弃",   # 高开过甚 +5~+9.8%：缺口吃掉涨幅，实测该档 -1.37%
+    "yz":   "弃",   # 顶一字 >=+9.8%：买不进且几乎无肉，实测 -3.70%
+    "gold": "观",   # 低开 -4~-1%：高开模式下不纳入
+    "deep": "慎",   # 深低开 <=-4%
+    "mic":  "观",   # 微低开 -1~0%（陷阱档）
+}
 _VETO_MARK = "避"    # 放量下跌(竞价量比≥3.5 且低开)：实测该档 -2.28%/胜率33%，已降位
 
 
-def _slot_mark(p: dict) -> str:
+def _buy_marks(meta: dict | None) -> dict:
+    """按买点模式返回标记表。
+
+    模式取自快照/接口的 meta（由 reco_engine.GAP_MODE 经 base_meta → freeze 落盘下发），
+    刻意**不 import reco_engine** —— 保持推送脚本与引擎解耦，快照自描述即可。
+    """
+    if str((meta or {}).get("gap_mode") or "").lower() == "high":
+        return _BUY_MARK_HIGH
+    return _BUY_MARK
+
+
+def _slot_mark(p: dict, meta: dict | None = None) -> str:
     """买点标记（单字，避免挤占名称空间）。
 
     ⚠️ 它只表达「仓位/买不买」的参考提示，**不再决定推不推** —— 2026-09-22 起推送
@@ -420,12 +450,13 @@ def _slot_mark(p: dict) -> str:
     if p.get("veto"):
         return _VETO_MARK
     code = p.get("buy_code")
-    if code in _BUY_MARK:
-        return _BUY_MARK[code]
+    marks = _buy_marks(meta)
+    if code in marks:
+        return marks[code]
     return "待" if _gap_of(p) is None else "观"
 
 
-def _slot_text(p: dict) -> str:
+def _slot_text(p: dict, meta: dict | None = None) -> str:
     """「简称+代码+缺口+标记」，最坏 19 字符（thing 上限 20）。
 
     实测：缺口格式化后最长为 `-10.0%`(6 字符)，简称最长为 6 字符
@@ -434,10 +465,33 @@ def _slot_text(p: dict) -> str:
     """
     g = _gap_of(p)
     gs = f"{g:+.1f}%" if g is not None else "--"
-    s = f"{p.get('name','')}{p.get('code','')} {gs}{_slot_mark(p)}"
+    s = f"{p.get('name','')}{p.get('code','')} {gs}{_slot_mark(p, meta)}"
     if len(s) >= THING_MAX:                      # 兜底：简称压到 4 字
-        s = f"{str(p.get('name',''))[:4]}{p.get('code','')} {gs}{_slot_mark(p)}"
+        s = f"{str(p.get('name',''))[:4]}{p.get('code','')} {gs}{_slot_mark(p, meta)}"
     return clip(s)
+
+
+def _buy_gate_text(meta: dict) -> str:
+    """提示位文案 = 当前生效的**买点门槛**（老张最关注这个字段）。
+
+    为什么不能硬编码：2026-09-23 之前 `build_single` 里写死「只买低开-4~-1%，其余观望」，
+    改成高开模式后文案不跟随，会推着高开票却让用户「只买低开」——文案与内容自相矛盾。
+    现按 meta.gap_mode（由 reco_engine.GAP_MODE → base_meta → freeze 落盘下发）动态生成，
+    与 `_BUY_MARK_HIGH` 严格同源。
+    """
+    m = str((meta or {}).get("gap_mode") or "").lower()
+    if m == "high":
+        s = "只买高开0~5%"
+        mb = (meta or {}).get("max_board")
+        if mb:
+            s += "·%s板内" % mb
+        return s
+    return "只买低开-4~-1%"
+
+
+def _tip_value(meta: dict, picks: list) -> str:
+    """提示位最终取值：命令行 --tip 覆盖 > 买点门槛。"""
+    return clip(str(meta.get("tip_override") or _buy_gate_text(meta)))
 
 
 def _tip_text(meta: dict, picks: list, override: str | None = None) -> str:
@@ -474,11 +528,13 @@ def build_slots(picks: list, meta: dict, fields: dict) -> list[dict]:
         if not key:
             continue
         p = picks[i] if i < len(picks) else None
-        data[key] = {"value": _slot_text(p) if p else "无"}
+        data[key] = {"value": _slot_text(p, meta) if p else "无"}
     if fields.get("time"):
         data[fields["time"]] = {"value": _t(meta)}
     if fields.get("tip"):
-        data[fields["tip"]] = {"value": _tip_text(meta, picks, meta.get("tip_override"))}
+        # 2026-09-23：由固定卖点文案改为**当前买点门槛**（高开模式下自动变
+        # 「只买高开0~5%·4板内」），与 _slot_mark 的买/观/弃标记同源，不会再互相打架。
+        data[fields["tip"]] = {"value": _tip_value(meta, picks)}
     return [{"stock": "3只分列", "data": data}]
 
 
